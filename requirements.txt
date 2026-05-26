@@ -1,0 +1,12 @@
+# Runtime-afhankelijkheden
+music21>=9.1          # muziekanalyse + ingebouwd Bach-corpus
+
+# Optioneel maar aanbevolen
+# pandas>=2.2         # dataverwerking
+# scikit-learn>=1.4   # ML-modellen
+# librosa>=0.10       # audio-analyse
+
+# Ontwikkelingstools
+pytest>=8.0
+pytest-cov>=5.0
+ruff>=0.4
