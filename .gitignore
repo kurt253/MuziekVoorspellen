@@ -24,8 +24,9 @@ htmlcov/
 *.ipynb
 
 # Data (grote bestanden niet inchecken)
-data/raw/*
-data/processed/*
+data/**
+!data/raw/
+!data/processed/
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 

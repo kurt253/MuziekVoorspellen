@@ -1,10 +1,10 @@
 # Runtime-afhankelijkheden
 music21>=9.1          # muziekanalyse + ingebouwd Bach-corpus
-
-# Optioneel maar aanbevolen
-# pandas>=2.2         # dataverwerking
-# scikit-learn>=1.4   # ML-modellen
-# librosa>=0.10       # audio-analyse
+streamlit>=1.35       # webinterface
+torch>=2.2            # LSTM-model
+numpy>=1.26           # matrix- en arrayoperaties
+pandas>=2.2           # dataverwerking
+matplotlib>=3.8       # trainingsverloop visualiseren
 
 # Ontwikkelingstools
 pytest>=8.0
