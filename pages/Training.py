@@ -241,6 +241,7 @@ def main() -> None:
     df_selectie = df_type.sample(n=aantal, random_state=42).reset_index(drop=True)
 
     st.caption(f"{aantal} van {max_aantal} werken geselecteerd")
+    st.write(df_selectie.columns.tolist()) # added for debugging
     st.dataframe(
         df_selectie[["naam", "classificatie", "maten", "aantal_stemmen", "stemmen"]],
         use_container_width=True,
