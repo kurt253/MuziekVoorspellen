@@ -23,13 +23,18 @@ METADATA_CSV = DATA_DIR / "processed" / "bach_metadata.csv"
 MODEL_DIR    = DATA_DIR / "processed"
 RAW_DIR      = DATA_DIR / "raw" / "bach"
 
+# Toegestane nootdurations in kwartnootheden (zelfde rooster als tijdens training)
 DUREN = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
 
-# VoiceToken = (midi_pitch, duur)  pitch=0 → rust
+# Aantal seed-maten voor de Bach-stijl generatiemodus
+N_SEED_MATEN = 4
+
+# Type alias: een stem-token = (MIDI-pitch, duur); pitch 0 = rust
 VoiceToken  = tuple[int, float]
-# ChordToken = (frozenset van MIDI-noten, duur)  — alleen voor MIDI-uitvoer
+# Type alias: een akkoord-token = (frozenset van pitches, duur) — alleen voor MIDI-uitvoer
 ChordToken  = tuple[frozenset[int], float]
 
+# CDN-bundel: Tone.js + Magenta + html-midi-player in één request
 _MIDI_CDN = (
     "https://cdn.jsdelivr.net/combine/"
     "npm/tone@14,"
@@ -39,7 +44,30 @@ _MIDI_CDN = (
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
+
 class LSTMModel(nn.Module):
+    """LSTM-taalmodel voor muziekgeneratie op token-niveau.
+
+    Identieke architectuur als in Training.py zodat opgeslagen gewichten
+    direct geladen kunnen worden zonder aanpassingen.
+
+    Architectuur:
+      Embedding(vocab, embed_dim) → LSTM(lagen, hidden) → Dropout → Linear(vocab)
+
+    Parameters
+    ----------
+    vocab:
+        Vocabulairegrootte (aantal unieke tokens).
+    embed_dim:
+        Dimensie van de tokenembedding (standaard 64).
+    hidden:
+        Aantal hidden units per LSTM-laag (standaard 256).
+    lagen:
+        Aantal gestapelde LSTM-lagen (standaard 2).
+    dropout:
+        Dropout-kans na LSTM en tussen lagen (bij lagen > 1).
+    """
+
     def __init__(self, vocab: int, embed_dim: int = 64, hidden: int = 256,
                  lagen: int = 2, dropout: float = 0.3):
         super().__init__()
@@ -51,21 +79,56 @@ class LSTMModel(nn.Module):
         self.fc        = nn.Linear(hidden, vocab)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Voorwaartse pass: verwerk tokenreeksen naar logits.
+
+        Parameters
+        ----------
+        x:
+            Tensor van shape (batch, venster) met token-indices.
+
+        Returns
+        -------
+        Logits-tensor van shape (batch, vocab_grootte).
+        """
         x = self.embedding(x)
         out, _ = self.lstm(x)
         return self.fc(self.dropout(out[:, -1, :]))
 
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
+
 def _kwantiseer_duur(duur: float) -> float:
+    """Rond een duur af naar de dichtstbijzijnde waarde uit het DUREN-rooster.
+
+    Normaliseert micro-timings uit MIDI naar het vaste duratierooster zodat
+    tokens overeenkomen met het vocabulaire dat tijdens training gebruikt werd.
+
+    Parameters
+    ----------
+    duur:
+        Originele duur in kwartnootheden.
+
+    Returns
+    -------
+    Dichtstbijzijnde waarde uit DUREN.
+    """
     return min(DUREN, key=lambda d: abs(d - duur))
 
 
 @st.cache_data
 def _laad_data() -> pd.DataFrame:
+    """Laad en merge de analyse- en metadata-CSV's tot één werkend DataFrame.
+
+    Combineert:
+      - bach_analyse.csv: classificatie, maten, stemnamen
+      - bach_metadata.csv: absoluut MIDI-pad
+
+    Gecached zodat de CSV niet bij elke Streamlit-rerun opnieuw geladen wordt.
+    """
     analyse  = pd.read_csv(ANALYSE_CSV)
     metadata = pd.read_csv(METADATA_CSV)
     metadata["midi_pad"] = metadata["midi_pad"].apply(lambda p: str(DATA_DIR / p))
+    metadata = metadata.drop(columns=["maten", "stemmen"], errors="ignore")
     return (
         analyse.merge(metadata, on="naam", how="inner")
         .drop(columns=["bestandsnaam"], errors="ignore")
@@ -73,10 +136,24 @@ def _laad_data() -> pd.DataFrame:
 
 
 def _beschikbare_modellen() -> list[Path]:
+    """Geef een gesorteerde lijst van alle getrainde modelbestanden in MODEL_DIR.
+
+    Zoekt naar bestanden die overeenkomen met het patroon lstm_*.pt.
+    """
     return sorted(MODEL_DIR.glob("lstm_*.pt"))
 
 
 def _model_label(pad: Path) -> str:
+    """Zet een modelbestandsnaam om naar een leesbaar label voor de selectbox.
+
+    Verwacht bestandsnamen van de vorm: lstm_<soort>_<n>.pt
+    Geeft terug: "<soort>  —  <n> werken  (<bestandsnaam>)"
+
+    Parameters
+    ----------
+    pad:
+        Pad naar het .pt-modelbestand.
+    """
     m = re.match(r"lstm_(.+)_(\d+)\.pt$", pad.name)
     if m:
         soort = m.group(1).replace("_", " ").strip()
@@ -86,6 +163,31 @@ def _model_label(pad: Path) -> str:
 
 @st.cache_resource
 def _laad_model_en_vocab(model_pad_str: str) -> tuple[LSTMModel, dict[VoiceToken, int]]:
+    """Laad een getraind LSTM-model en het bijbehorende vocabulaire van disk.
+
+    Leidt de modelarchitectuur automatisch af uit de state-dict zodat er geen
+    aparte configuratie opgeslagen hoeft te worden:
+      - embed_dim:  uit de vorm van embedding.weight
+      - hidden:     uit de vorm van fc.weight
+      - lagen:      door te tellen hoeveel lstm.weight_ih_l<N> sleutels er zijn
+
+    Gecached via st.cache_resource zodat het model niet bij elke generatie
+    opnieuw van disk geladen wordt (is zwaar voor grote modellen).
+
+    Parameters
+    ----------
+    model_pad_str:
+        String-pad naar het .pt-modelbestand (string i.p.v. Path voor caching).
+
+    Returns
+    -------
+    Tuple van (geïnitialiseerd LSTMModel in eval-modus, vocab-dict).
+
+    Raises
+    ------
+    FileNotFoundError:
+        Als het bijbehorende vocab-bestand (<stem>_vocab.pkl) niet bestaat.
+    """
     model_pad = Path(model_pad_str)
     vocab_pad = model_pad.with_name(model_pad.stem + "_vocab.pkl")
 
@@ -104,16 +206,34 @@ def _laad_model_en_vocab(model_pad_str: str) -> tuple[LSTMModel, dict[VoiceToken
 
 
 # ── MIDI / token conversie ────────────────────────────────────────────────────
+
 def _midi_naar_stemmen_per_maat(pad: str) -> list[list[list[VoiceToken]]]:
-    """Geef per maat, per stem een lijst VoiceTokens.
+    """Parseer een MIDI-bestand naar een hiërarchische structuur per maat per stem.
+
+    Resultaat: list[maat_index] → list[stem_index] → list[VoiceToken]
+
+    Alle Parts worden doorlopen. Per maat worden alle noten en rusten als
+    VoiceToken opgeslagen. Akkoorden worden gereduceerd tot de hoogste noot.
+    Lege maten (geen tokens) worden weggegooid.
+
+    Deze structuur maakt het mogelijk om:
+      - De eerste helft als seed te gebruiken
+      - Per stem het ritme of de melodie te genereren
+      - De split op maatniveau precies te bepalen
+
+    Parameters
+    ----------
+    pad:
+        Pad naar het .mid-bestand.
 
     Returns
     -------
-    list[maat_index] → list[stem_index] → list[VoiceToken]
+    Lijst van niet-lege maten, elk een lijst van stemmen,
+    elk een lijst van VoiceTokens.
     """
     from music21 import converter, note, chord
 
-    score = converter.parse(pad)
+    score  = converter.parse(pad)
     n_maten = max(
         len(list(part.getElementsByClass("Measure"))) for part in score.parts
     )
@@ -137,7 +257,7 @@ def _midi_naar_stemmen_per_maat(pad: str) -> list[list[list[VoiceToken]]]:
             if stem_tokens:
                 per_maat[maat_i].append(stem_tokens)
 
-    return [m for m in per_maat if m]   # lege maten weggooien
+    return [m for m in per_maat if m]
 
 
 def _combineer_stemmen_naar_akkoorden(
@@ -145,13 +265,30 @@ def _combineer_stemmen_naar_akkoorden(
 ) -> list[ChordToken]:
     """Combineer per-stem VoiceTokens naar ChordTokens via tijdsuitlijning.
 
+    Omdat stemmen verschillende ritmes kunnen hebben, worden alle noten eerst
+    omgezet naar (start, einde, pitch)-events. Vervolgens worden alle unieke
+    tijdstippen bepaald en voor elk interval worden de actieve noten verzameld.
+
     Stap 1: bereken (start, einde, pitch) per noot in elke stem.
-    Stap 2: verzamel alle unieke tijdstippen.
-    Stap 3: voor elk interval, verzamel actieve noten → ChordToken.
+    Stap 2: verzamel alle unieke tijdstippen (begin + einde van elke noot).
+    Stap 3: voor elk interval [t0, t1]: verzamel pitches actief op t0 → ChordToken.
+
+    Rusten (pitch 0) worden niet opgenomen in het akkoord.
+    Lege akkoorden (alleen rusten) resulteren in een ChordToken met lege frozenset.
+
+    Parameters
+    ----------
+    stemmen:
+        Lijst van stemmen, elk een lijst van VoiceTokens.
+
+    Returns
+    -------
+    Lijst van ChordTokens in chronologische volgorde.
     """
     if not stemmen:
         return []
 
+    # Bereken absolute tijdstippen voor elke noot
     events: list[tuple[float, float, int]] = []
     for stem in stemmen:
         t = 0.0
@@ -159,6 +296,7 @@ def _combineer_stemmen_naar_akkoorden(
             events.append((t, t + duur, pitch))
             t += duur
 
+    # Alle unieke tijdstippen bepalen voor de uitlijning
     tijdstippen = sorted({e[0] for e in events} | {e[1] for e in events})
 
     resultaat: list[ChordToken] = []
@@ -168,6 +306,7 @@ def _combineer_stemmen_naar_akkoorden(
         dur = _kwantiseer_duur(t1 - t0)
         if dur == 0:
             continue
+        # Verzamel alle pitches die actief zijn op tijdstip t0 (exclusief rusten)
         actief = frozenset(
             p for (s, e, p) in events if s <= t0 and t0 < e and p != 0
         )
@@ -177,6 +316,25 @@ def _combineer_stemmen_naar_akkoorden(
 
 
 def _chord_tokens_naar_midi_b64(tokens: list[ChordToken]) -> str:
+    """Converteer een lijst ChordTokens naar een base64-gecodeerd MIDI-bestand.
+
+    Bouwt een enkelvoudige Part op basis van de akkoordtokens:
+      - Lege frozenset → rust
+      - Één pitch → enkelvoudige noot
+      - Meerdere pitches → akkoord (gesorteerd van laag naar hoog)
+
+    De MIDI wordt volledig in RAM gebouwd via music21 en als base64 teruggegeven.
+    Er wordt niets naar disk geschreven.
+
+    Parameters
+    ----------
+    tokens:
+        Lijst van (frozenset[pitches], duur)-tuples.
+
+    Returns
+    -------
+    Base64-gecodeerde string van het MIDI-bestand.
+    """
     from music21 import stream, note, chord
     from music21.midi import translate as midi_translate
 
@@ -197,7 +355,21 @@ def _chord_tokens_naar_midi_b64(tokens: list[ChordToken]) -> str:
 
 
 def _tempo_uit_midi(midi_pad: str) -> float:
-    """Geeft het eerste tempomarkering in BPM, standaard 120."""
+    """Lees het eerste tempomarkering uit een MIDI-bestand in BPM.
+
+    Wordt gebruikt om maat-starttijden in seconden te berekenen voor de
+    JavaScript maatenteller in de piano-roll weergave.
+
+    Parameters
+    ----------
+    midi_pad:
+        Pad naar het .mid-bestand.
+
+    Returns
+    -------
+    Tempo in BPM. Standaard 120 als geen tempomarkering gevonden wordt of
+    bij een parse-fout.
+    """
     from music21 import converter
     try:
         score  = converter.parse(midi_pad)
@@ -214,18 +386,39 @@ def _eerste_helft_plus_ai_b64(
     helft_maten: int,
     ai_stemmen: list[list[VoiceToken]],
 ) -> str:
-    """Originele eerste helft (alle stemmen) + elke AI-stem als aparte part.
+    """Combineer de originele eerste helft met AI-gegenereerde stemmen in één MIDI.
 
-    Elke stem behoudt zijn onafhankelijke ritmische lijn; ze worden NIET
-    samengeperst tot één akkoordstroom.
+    Elke AI-stem krijgt een eigen Part zodat de onafhankelijke ritmische lijnen
+    bewaard blijven (niet samengeperst tot één akkoordstroom).
+
+    Verloop:
+      1. Parseer het originele MIDI-bestand.
+      2. Bepaal de splitoffset in kwartnootheden op basis van helft_maten.
+      3. Kopieer alle originele noten vóór de splitoffset naar nieuwe Parts.
+      4. Voeg elke AI-stem toe als eigen Part, startend op de splitoffset.
+      5. Exporteer naar MIDI-bytes in RAM en codeer als base64.
+
+    Parameters
+    ----------
+    midi_pad:
+        Pad naar het originele .mid-bestand (voor de eerste helft).
+    helft_maten:
+        Aantal maten dat als originele eerste helft bewaard wordt.
+    ai_stemmen:
+        Lijst van AI-gegenereerde stems, elk een lijst VoiceTokens.
+
+    Returns
+    -------
+    Base64-gecodeerde string van het gecombineerde MIDI-bestand.
     """
     import copy
-    from music21 import converter, stream, note
+    from music21 import converter, stream, note, tempo as m21_tempo
     from music21.midi import translate as midi_translate
 
     score    = converter.parse(midi_pad)
     ch_maten = list(score.chordify().getElementsByClass("Measure"))
 
+    # Bepaal de offset (in kwartnootheden) waarop de AI-stemmen beginnen
     split_offset = (
         float(ch_maten[helft_maten].offset)
         if helft_maten < len(ch_maten)
@@ -234,7 +427,11 @@ def _eerste_helft_plus_ai_b64(
 
     gecombineerd = stream.Score()
 
-    # Originele stemmen: eerste helft bewaard
+    # Kopieer tempomarkeringen zodat het gegenereerde stuk even snel afspeelt
+    for mm in score.flatten().getElementsByClass(m21_tempo.MetronomeMark):
+        gecombineerd.insert(float(mm.offset), copy.deepcopy(mm))
+
+    # Originele stemmen: kopieer alleen noten vóór de splitoffset
     for part in score.parts:
         nieuwe_part = stream.Part()
         for el in part.flatten().notesAndRests:
@@ -242,7 +439,7 @@ def _eerste_helft_plus_ai_b64(
                 nieuwe_part.insert(float(el.offset), copy.deepcopy(el))
         gecombineerd.append(nieuwe_part)
 
-    # AI-stemmen: elke stem als eigen part met eigen ritme
+    # AI-stemmen: elke stem als eigen Part, startend op split_offset
     for stem_tokens in ai_stemmen:
         ai_part    = stream.Part()
         cur_offset = split_offset
@@ -259,7 +456,8 @@ def _eerste_helft_plus_ai_b64(
     return base64.b64encode(mf.writestr()).decode()
 
 
-# ── Generatie — fase 1: ritme ─────────────────────────────────────────────────
+# ── Generatie — fase 1: ritme (model-gestuurd) ───────────────────────────────
+
 def _genereer_ritme(
     model: LSTMModel,
     seed_codes: list[int],
@@ -270,14 +468,48 @@ def _genereer_ritme(
     temperatuur: float,
     top_k: int = 0,
 ) -> list[float]:
-    """Genereer een onafhankelijke duurvolgorde voor één stem.
+    """Genereer een duurvolgorde voor één stem via het LSTM-model.
 
-    P(duur | context) = Σ_pitch  P(pitch, duur | context)
-    Elke stem krijgt zo zijn eigen ritmisch karakter.
+    Wordt gebruikt in de Bach-stijl modus waarbij het model ook het ritme
+    volledig zelf bepaalt (in tegenstelling tot de aanvullingsmodus waarbij
+    het originele ritme overgenomen wordt).
+
+    De kans op een duur wordt berekend als de marginale som over alle
+    tokens met die duur:
+        P(duur | context) = Σ_pitch  P(pitch, duur | context)
+
+    Generatie stopt zodra de totale duur >= doelduur, of na max_stappen
+    als veiligheidsnet (voorkomt eindeloze lussen bij lage temperatuur).
+
+    Parameters
+    ----------
+    model:
+        Getraind LSTMModel in eval-modus.
+    seed_codes:
+        Lijst van token-indices die als context dienen (eerste helft).
+    doelduur:
+        Gewenste totale duur in kwartnootheden.
+    duur_naar_codes:
+        Dict die elke duur mapt naar de lijst van token-indices met die duur.
+    duuren:
+        Gesorteerde lijst van alle unieke durations in het vocabulaire.
+    venster:
+        Contextlengte (sliding window over de gegenereerde tokens).
+    temperatuur:
+        Regelt de willekeur: lager = voorspelbaarder, hoger = creatiever.
+        Wordt geclampd op minimaal 1e-6 om deling door nul te voorkomen.
+    top_k:
+        Als > 0, worden alleen de k meest waarschijnlijke tokens overwogen
+        vóór de duur-marginalisatie. 0 = alle tokens gebruiken.
+
+    Returns
+    -------
+    Lijst van durations (kwartnootheden) voor de gegenereerde stem.
     """
     ctx         = list(seed_codes)
     duur_seq:   list[float] = []
     totaal_duur = 0.0
+    # Veiligheidsgrens: bij erg korte noten kan de lus lang duren
     max_stappen = max(500, int(doelduur / 0.25) * 10)
 
     model.eval()
@@ -285,35 +517,78 @@ def _genereer_ritme(
         for _ in range(max_stappen):
             if totaal_duur >= doelduur:
                 break
-
             inp = ctx[-venster:]
             if len(inp) < venster:
                 inp = [0] * (venster - len(inp)) + inp
             logits = model(torch.tensor([inp], dtype=torch.long))[0]
+
+            # Top-k filtering: maskeer tokens buiten de top-k op -inf
             if top_k > 0:
                 grens  = torch.topk(logits, min(top_k, logits.size(-1))).values[-1]
                 logits = logits.masked_fill(logits < grens, float("-inf"))
+
             probs = torch.softmax(logits / max(temperatuur, 1e-6), dim=0)
 
-            # Marginaliseer: P(duur) = som over alle pitches
+            # Marginaliseer over pitches: bereken gewicht per duur
             duur_w = torch.tensor([
                 sum(probs[c].item() for c in duur_naar_codes[d])
                 for d in duuren
             ])
-            duur_w = torch.clamp(duur_w, min=1e-9)
+            duur_w = torch.clamp(duur_w, min=1e-9)  # voorkom nul-gewichten
             duur_w /= duur_w.sum()
             gekozen = duuren[torch.multinomial(duur_w, 1).item()]
 
             duur_seq.append(gekozen)
             totaal_duur += gekozen
-            # Context bijwerken met meest waarschijnlijke pitch voor die duur
+            # Voeg de meest waarschijnlijke pitch voor deze duur toe aan de context
             codes = duur_naar_codes[gekozen]
             ctx.append(max(codes, key=lambda c: probs[c].item()))
 
     return duur_seq
 
 
+# ── Toonaard detectie ─────────────────────────────────────────────────────────
+
+def _toonaard_uit_noten(noten: list[VoiceToken]) -> set[int]:
+    """Detecteer de toonaard van een reeks noten via music21's key-analyse.
+
+    Bouwt een tijdelijke Part op basis van de opgegeven noten en laat
+    music21's Krumhansl-Schmuckler algoritme de toonaard bepalen.
+    Geeft de pitchklassen (0–11) terug van de gedetecteerde toonladder.
+
+    Wordt gebruikt om de AI-generatie te beperken tot noten die in de
+    toonaard van de eerste helft passen (aanvullingsmodus).
+
+    Parameters
+    ----------
+    noten:
+        Lijst van VoiceTokens uit de eerste helft van het werk.
+
+    Returns
+    -------
+    Set van MIDI-pitchklassen (0–11) die in de gedetecteerde toonaard passen.
+    Geeft alle 12 pitchklassen terug bij een analyse-fout (geen beperking).
+    """
+    from music21 import stream, note as note21
+
+    part   = stream.Part()
+    offset = 0.0
+    for pitch_midi, duur in noten:
+        if pitch_midi != 0:
+            n = note21.Note()
+            n.pitch.midi = pitch_midi
+            n.duration.quarterLength = duur
+            part.insert(offset, n)
+        offset += duur
+    try:
+        key = part.analyze("key")
+        return {p.pitchClass for p in key.pitches}
+    except Exception:
+        return set(range(12))
+
+
 # ── Generatie — fase 2: melodie op vastgelegd ritme ───────────────────────────
+
 def _genereer_melodie(
     model: LSTMModel,
     seed_codes: list[int],
@@ -323,10 +598,45 @@ def _genereer_melodie(
     venster: int,
     temperatuur: float,
     top_k: int = 0,
+    toegestane_pitchklassen: set[int] | None = None,
 ) -> list[VoiceToken]:
-    """Genereer pitches voor één stem op een vastgelegd ritmeschema.
+    """Genereer pitches voor één stem op een vooraf vastgelegd ritmeschema.
 
-    Per duurslot worden alleen tokens met die exacte duur gesampled.
+    Voor elk duurslot in duur_seq wordt het model gevraagd een pitch te kiezen.
+    Alleen tokens met exact die duur worden als kandidaat beschouwd.
+
+    Pitch 0 (rust) is altijd toegestaan ongeacht de toonaard-filter.
+    Overige pitches worden gefilterd op de gedetecteerde toonaard als
+    toegestane_pitchklassen opgegeven is.
+
+    Als na toonaard-filtering geen tokens overblijven, worden alle tokens
+    met de juiste duur gebruikt (veiligheidsnet).
+
+    Parameters
+    ----------
+    model:
+        Getraind LSTMModel in eval-modus.
+    seed_codes:
+        Token-indices van de eerste helft als startcontext.
+    duur_seq:
+        Vastgelegde duurvolgorde (output van fase 1 of origineel ritme).
+    duur_naar_codes:
+        Dict die elke duur mapt naar token-indices met die duur.
+    inv_vocab:
+        Omgekeerd vocabulaire: integer index → VoiceToken.
+    venster:
+        Contextlengte voor het model.
+    temperatuur:
+        Willekeur van de sampling.
+    top_k:
+        Top-k filtering vóór toonaard-filter. 0 = uit.
+    toegestane_pitchklassen:
+        Set van MIDI-pitchklassen (0–11) die toegestaan zijn.
+        None = geen beperking (Bach-stijl modus).
+
+    Returns
+    -------
+    Lijst van VoiceTokens (pitch, duur) voor de gegenereerde stem.
     """
     ctx       = list(seed_codes)
     resultaat: list[VoiceToken] = []
@@ -338,12 +648,27 @@ def _genereer_melodie(
             if len(inp) < venster:
                 inp = [0] * (venster - len(inp)) + inp
             logits = model(torch.tensor([inp], dtype=torch.long))[0]
+
+            # Top-k filtering
             if top_k > 0:
                 grens  = torch.topk(logits, min(top_k, logits.size(-1))).values[-1]
                 logits = logits.masked_fill(logits < grens, float("-inf"))
+
             probs = torch.softmax(logits / max(temperatuur, 1e-6), dim=0)
 
-            codes   = duur_naar_codes[duur_slot]
+            # Selecteer kandidaten met de juiste duur
+            codes = duur_naar_codes[duur_slot]
+
+            # Toonaard-filter: verwijder pitches die niet in de toonaard passen
+            if toegestane_pitchklassen is not None:
+                gefilterd = [
+                    c for c in codes
+                    if inv_vocab[c][0] == 0 or (inv_vocab[c][0] % 12) in toegestane_pitchklassen
+                ]
+                if gefilterd:
+                    codes = gefilterd
+
+            # Sample één token gewogen naar de model-kansen
             pitch_w = torch.clamp(
                 torch.tensor([probs[c].item() for c in codes]), min=1e-9
             )
@@ -357,6 +682,7 @@ def _genereer_melodie(
 
 
 # ── Piano-roll HTML ───────────────────────────────────────────────────────────
+
 def _piano_roll_html(
     midi_b64: str,
     hoogte: int = 280,
@@ -366,6 +692,41 @@ def _piano_roll_html(
     helft_maten: int = 0,
     is_ai: bool = False,
 ) -> str:
+    """Genereer een HTML-document met piano-roll speler en optionele maatenteller.
+
+    Bevat:
+      - html-midi-player webcomponent (afspelen + download via data-URI)
+      - midi-visualizer webcomponent (piano-roll met gekleurde noten)
+      - Optionele JavaScript maatenteller die elke 100ms de huidige afspeelttijd
+        controleert en het maatnummer toont.
+
+    De maatenteller kleurt het maatnummer:
+      - Blauw (#38bdf8): originele maten
+      - Geel (#f59e0b): AI-gegenereerde maten (alleen als is_ai=True)
+
+    Parameters
+    ----------
+    midi_b64:
+        Base64-gecodeerde MIDI-data.
+    hoogte:
+        Pixelhoogte van de piano-roll visualisatie.
+    uid:
+        Unieke identifier voor DOM-elementen (voorkomt conflicten bij
+        meerdere spelers op dezelfde pagina).
+    maat_starts_s:
+        Lijst van starttijden per maat in seconden. Als None, wordt
+        geen maatenteller getoond.
+    totaal_maten:
+        Totaal aantal maten in het werk (voor de "Maat X / Y" weergave).
+    helft_maten:
+        Maatnummer waarop de AI-aanvulling begint.
+    is_ai:
+        Als True, wordt kleurwisseling tussen origineel/AI getoond.
+
+    Returns
+    -------
+    HTML-string voor gebruik in st.components.v1.html().
+    """
     import json as _json
     pid = f"rol_{uid}"
 
@@ -415,6 +776,7 @@ def _piano_roll_html(
         lbl.textContent     = '({label_orig})';
       }}
     }}
+    // Poll elke 100ms: html-midi-player biedt geen native tijdsevent
     setInterval(updateMaat, 100);
   }})();
   </script>"""
@@ -447,7 +809,19 @@ def _piano_roll_html(
 
 
 # ── Scherm ────────────────────────────────────────────────────────────────────
+
 def main() -> None:
+    """Hoofdfunctie van de Streamlit-genereererpagina.
+
+    Opbouw van de pagina:
+      1. Model kiezen: selectbox met alle beschikbare lstm_*.pt bestanden.
+      2. Song kiezen: filterbare tabel met alle Bach-werken.
+      3. Instellingen: temperatuur en top-k sliders.
+      4. Twee generatieknoppen:
+           - Aanvulling: origineel ritme + toonaard behouden
+           - Bach-stijl: model genereert alles vrij
+      5. Resultaatweergave: metrics, splitsbalk, twee piano-rolls naast elkaar.
+    """
     st.set_page_config(page_title="Genereren", page_icon="🎵", layout="wide")
     st.title("🎵 Muziek genereren")
 
@@ -518,9 +892,9 @@ def main() -> None:
         st.info("Klik op een rij om een song te selecteren.")
         return
 
-    rij       = df_toon.iloc[event.selection.rows[0]]
-    midi_pad  = str(rij["midi_pad"])
-    song_naam = str(rij["naam"])
+    rij        = df_toon.iloc[event.selection.rows[0]]
+    midi_pad   = str(rij["midi_pad"])
+    song_naam  = str(rij["naam"])
     song_maten = int(rij["maten"]) if pd.notna(rij.get("maten")) else "?"
 
     st.caption(
@@ -546,24 +920,48 @@ def main() -> None:
                  "Hogere waarde = meer variatie, lagere waarde = betere akkoorden",
         )
 
-    # ── Genereer-knop ─────────────────────────────────────────────────────────
+    # ── Genereer-knoppen ──────────────────────────────────────────────────────
     st.divider()
-    if st.button("🎵 Genereer aanvulling", type="primary", use_container_width=True):
-        _voer_generatie_uit(
-            model_pad_str=str(model_keuze),
-            midi_pad=midi_pad,
-            song_naam=song_naam,
-            venster=int(venster),
-            temperatuur=float(temperatuur),
-            top_k=int(top_k),
-        )
+    col_k1, col_k2 = st.columns(2)
 
-    # ── Resultaat ─────────────────────────────────────────────────────────────
+    with col_k1:
+        st.markdown("**Aanvulling** — eerste helft als seed, origineel ritme + toonaard")
+        if st.button("🎵 Genereer aanvulling", type="primary", use_container_width=True):
+            _voer_generatie_uit(
+                model_pad_str=str(model_keuze),
+                midi_pad=midi_pad,
+                song_naam=song_naam,
+                venster=int(venster),
+                temperatuur=float(temperatuur),
+                top_k=int(top_k),
+            )
+
+    with col_k2:
+        st.markdown(f"**Bach-stijl** — eerste {N_SEED_MATEN} maten als seed, model genereert vrij")
+        if st.button("🎼 Genereer Bach-stijl", type="secondary", use_container_width=True):
+            _voer_vrije_generatie_uit(
+                model_pad_str=str(model_keuze),
+                midi_pad=midi_pad,
+                song_naam=song_naam,
+                venster=int(venster),
+                temperatuur=float(temperatuur),
+                top_k=int(top_k),
+            )
+
+    # ── Resultaten ────────────────────────────────────────────────────────────
     if (
         "gen_origineel_b64" in st.session_state
         and st.session_state.get("gen_song") == song_naam
     ):
+        st.subheader("Resultaat — Aanvulling")
         _toon_resultaat()
+
+    if (
+        "vrij_ai_b64" in st.session_state
+        and st.session_state.get("vrij_song") == song_naam
+    ):
+        st.subheader("Resultaat — Bach-stijl")
+        _toon_vrij_resultaat()
 
 
 def _voer_generatie_uit(
@@ -574,6 +972,35 @@ def _voer_generatie_uit(
     temperatuur: float,
     top_k: int = 0,
 ) -> None:
+    """Voer de aanvullingsmodus uit: eerste helft als seed, origineel ritme bewaard.
+
+    Verloop:
+      1. Model en vocabulaire laden.
+      2. MIDI inlezen en per maat + per stem splitsen.
+      3. Eerste helft als seed, tweede helft als doelreferentie.
+      4. Fase 1: kopieer het originele ritme van de tweede helft.
+      5. Detecteer de toonaard uit de eerste helft.
+      6. Fase 2: genereer pitches per stem op het gekopieerde ritme,
+         gefilterd op de gedetecteerde toonaard.
+      7. Bouw het gecombineerde MIDI-bestand (eerste helft + AI-stemmen).
+      8. Bereken maat-starttijden in seconden voor de maatenteller.
+      9. Sla alles op in st.session_state voor weergave door _toon_resultaat().
+
+    Parameters
+    ----------
+    model_pad_str:
+        Pad naar het .pt-modelbestand.
+    midi_pad:
+        Pad naar het originele .mid-bestand.
+    song_naam:
+        BWV-naam van het geselecteerde werk (voor session_state-koppeling).
+    venster:
+        Contextlengte voor het model.
+    temperatuur:
+        Sampling-temperatuur.
+    top_k:
+        Top-k filtering. 0 = uit.
+    """
     with st.status("Muziek genereren…", expanded=True) as status:
 
         st.write("Model en vocabulaire laden…")
@@ -598,7 +1025,7 @@ def _voer_generatie_uit(
 
         helft_maten = len(per_maat) // 2
 
-        # Gedeelde opzoektabel voor beide fasen
+        # Gedeelde opzoektabel: duur → lijst van token-indices met die duur
         duur_naar_codes: dict[float, list[int]] = {}
         for (_, d), idx in vocab.items():
             duur_naar_codes.setdefault(d, []).append(idx)
@@ -606,10 +1033,10 @@ def _voer_generatie_uit(
 
         n_stemmen = max(len(m) for m in per_maat)
 
-        # Bouw per-stem seeds en doelduren op
-        stem_seeds:  list[list[int]]   = []
-        stem_duuren: list[float]        = []
-        stem_tweede: list[list[VoiceToken]] = []
+        # Bouw per-stem seeds (eerste helft) en doelduren (tweede helft)
+        stem_seeds:  list[list[int]]            = []
+        stem_duuren: list[float]                = []
+        stem_tweede: list[list[VoiceToken]]     = []
         for stem_i in range(n_stemmen):
             eerste = [t for maat in per_maat[:helft_maten]
                       for t in (maat[stem_i] if stem_i < len(maat) else [])]
@@ -619,26 +1046,12 @@ def _voer_generatie_uit(
             stem_duuren.append(sum(d for _, d in tweede))
             stem_tweede.append(tweede)
 
-        # ── FASE 1: ritme vastleggen per stem ─────────────────────────────────
-        st.write("**Fase 1 — Ritme per stem vastleggen**")
+        # ── FASE 1: ritme overnemen van het origineel ─────────────────────────
+        st.write("**Fase 1 — Origineel ritme overnemen**")
         ritmes: list[list[float]] = []
         for stem_i in range(n_stemmen):
-            seeds      = stem_seeds[stem_i]
-            doelduur_s = stem_duuren[stem_i]
-            if len(seeds) < venster or doelduur_s == 0:
-                # Origineel ritme overnemen als fallback
-                ritmes.append([d for _, d in stem_tweede[stem_i]])
-                st.write(f"  Stem {stem_i + 1}: origineel ritme overgenomen")
-                continue
-
-            duur_seq = _genereer_ritme(
-                model, seeds, doelduur_s,
-                duur_naar_codes, duuren,
-                venster, temperatuur, top_k,
-            )
+            duur_seq = [d for _, d in stem_tweede[stem_i]]
             ritmes.append(duur_seq)
-
-            # Toon ritmeschema zodat afwijkingen per stem zichtbaar zijn
             schema = "  ".join(str(d) for d in duur_seq[:12])
             suffix = "…" if len(duur_seq) > 12 else ""
             st.write(
@@ -646,12 +1059,24 @@ def _voer_generatie_uit(
                 f"({len(duur_seq)} noten, {sum(duur_seq):.1f} kwartnootheden)"
             )
 
+        # ── Toonaard detecteren uit de eerste helft ───────────────────────────
+        st.write("Toonaard detecteren uit aangeboden deel…")
+        alle_eerste_helft: list[VoiceToken] = [
+            t
+            for stem_i in range(n_stemmen)
+            for maat in per_maat[:helft_maten]
+            for t in (maat[stem_i] if stem_i < len(maat) else [])
+        ]
+        toegestane_pitchklassen = _toonaard_uit_noten(alle_eerste_helft)
+        st.write(f"  Pitchklassen: {sorted(toegestane_pitchklassen)}")
+
         # ── FASE 2: melodie per stem op het vastgelegde ritme ─────────────────
         st.write("**Fase 2 — Melodie per stem genereren**")
         ai_stemmen: list[list[VoiceToken]] = []
         for stem_i in range(n_stemmen):
             seeds = stem_seeds[stem_i]
             if len(seeds) < venster or not ritmes[stem_i]:
+                # Onvoldoende seed-data: gebruik originele tweede helft als fallback
                 ai_stemmen.append(stem_tweede[stem_i])
                 continue
 
@@ -660,6 +1085,7 @@ def _voer_generatie_uit(
                 model, seeds, ritmes[stem_i],
                 duur_naar_codes, inv_vocab,
                 venster, temperatuur, top_k,
+                toegestane_pitchklassen=toegestane_pitchklassen,
             )
             ai_stemmen.append(melodie)
 
@@ -669,24 +1095,25 @@ def _voer_generatie_uit(
 
         ai_b64 = _eerste_helft_plus_ai_b64(midi_pad, helft_maten, ai_stemmen)
 
-        # Maatstarttijden (voor maatenteller) op basis van origineel tempo
+        # Maatstarttijden in seconden berekenen voor de JavaScript maatenteller
         bpm = _tempo_uit_midi(midi_pad)
-        SPQ = 60.0 / bpm
+        SPQ = 60.0 / bpm   # seconden per kwartnoot
         maat_starts_s: list[float] = []
         cumulatief = 0.0
         for maat in per_maat:
             maat_starts_s.append(round(cumulatief * SPQ, 4))
             if maat:
-                for _, duur in maat[0]:    # gebruik stem 0 voor duurinfo
+                for _, duur in maat[0]:
                     cumulatief += duur
 
-        totaal_nieuwe = sum(len(s) for s in ai_stemmen)
+        totaal_nieuwe  = sum(len(s) for s in ai_stemmen)
         totaal_orig_2e = sum(
             len(maat[si] if si < len(maat) else [])
             for maat in per_maat[helft_maten:]
             for si in range(n_stemmen)
         )
 
+        # Sla alles op in session_state; _toon_resultaat() leest hieruit
         st.session_state.update({
             "gen_origineel_b64":   origineel_b64,
             "gen_ai_b64":          ai_b64,
@@ -705,6 +1132,13 @@ def _voer_generatie_uit(
 
 
 def _toon_resultaat() -> None:
+    """Toon het resultaat van de aanvullingsmodus.
+
+    Leest de gegenereerde MIDI en metadata uit st.session_state en toont:
+      - Vier metrics: totaal maten, eerste/tweede helft bereik, token-count
+      - Een visuele splitsbalk (blauw = origineel, geel = AI)
+      - Twee piano-rolls naast elkaar: origineel vs. AI-aanvulling
+    """
     st.divider()
 
     hm   = st.session_state["gen_helft_maten"]
@@ -713,14 +1147,14 @@ def _toon_resultaat() -> None:
     nt   = st.session_state["gen_nieuwe_tokens"]
     ot   = st.session_state["gen_orig_2e_tokens"]
 
-    # ── Maatenteller ─────────────────────────────────────────────────────────
+    # ── Metrics ───────────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Totaal maten",          tm)
+    c1.metric("Totaal maten",             tm)
     c2.metric("Eerste helft (origineel)", f"maat 1 – {hm}")
-    c3.metric("Tweede helft (AI)",     f"maat {hm + 1} – {tm}")
-    c4.metric("Tokens gegenereerd",    f"{nt}  (orig: {ot})")
+    c3.metric("Tweede helft (AI)",        f"maat {hm + 1} – {tm}")
+    c4.metric("Tokens gegenereerd",       f"{nt}  (orig: {ot})")
 
-    # Visuele splitsbalk
+    # Visuele splitsbalk: blauw = origineel, geel = AI
     frac = hm / tm
     st.markdown(
         f"""
@@ -736,9 +1170,8 @@ def _toon_resultaat() -> None:
         unsafe_allow_html=True,
     )
 
-    # ── Piano rolls ───────────────────────────────────────────────────────────
+    # ── Piano rolls naast elkaar ──────────────────────────────────────────────
     col1, col2 = st.columns(2)
-
     maat_starts = st.session_state.get("gen_maat_starts_s", [])
 
     with col1:
@@ -764,6 +1197,227 @@ def _toon_resultaat() -> None:
                 hoogte=300, uid="ai",
                 maat_starts_s=maat_starts,
                 totaal_maten=tm, helft_maten=hm,
+                is_ai=True,
+            ),
+            height=420, scrolling=False,
+        )
+
+
+def _voer_vrije_generatie_uit(
+    model_pad_str: str,
+    midi_pad: str,
+    song_naam: str,
+    venster: int,
+    temperatuur: float,
+    top_k: int = 0,
+) -> None:
+    """Voer de Bach-stijl modus uit: eerste N_SEED_MATEN maten als seed, rest vrij.
+
+    In tegenstelling tot de aanvullingsmodus genereert het model hier ook het
+    ritme volledig zelf (fase 1). Er is geen toonaard-filter (fase 2).
+
+    Verloop:
+      1. Model en vocabulaire laden.
+      2. MIDI inlezen.
+      3. Eerste N_SEED_MATEN maten als seed per stem.
+      4. Fase 1: model genereert ritme vrij via _genereer_ritme().
+      5. Fase 2: model genereert pitches vrij via _genereer_melodie()
+         (toegestane_pitchklassen=None → geen filter).
+      6. MIDI bouwen en opslaan in session_state.
+
+    Parameters
+    ----------
+    model_pad_str:
+        Pad naar het .pt-modelbestand.
+    midi_pad:
+        Pad naar het originele .mid-bestand (voor seed + originele vergelijking).
+    song_naam:
+        BWV-naam voor session_state-koppeling.
+    venster:
+        Contextlengte voor het model.
+    temperatuur:
+        Sampling-temperatuur.
+    top_k:
+        Top-k filtering. 0 = uit.
+    """
+    with st.status("Bach-stijl muziek genereren…", expanded=True) as status:
+
+        st.write("Model en vocabulaire laden…")
+        try:
+            model, vocab = _laad_model_en_vocab(model_pad_str)
+        except FileNotFoundError as e:
+            st.error(f"Vocab-bestand niet gevonden: {e}")
+            return
+
+        inv_vocab = {i: t for t, i in vocab.items()}
+
+        st.write("Song inlezen…")
+        try:
+            per_maat = _midi_naar_stemmen_per_maat(midi_pad)
+        except Exception as e:
+            st.error(f"MIDI-bestand kon niet worden geladen: {e}")
+            return
+
+        n_maten = len(per_maat)
+        if n_maten <= N_SEED_MATEN:
+            st.error(f"Song heeft te weinig maten ({n_maten}); minimum is {N_SEED_MATEN + 1}.")
+            return
+
+        duur_naar_codes: dict[float, list[int]] = {}
+        for (_, d), idx in vocab.items():
+            duur_naar_codes.setdefault(d, []).append(idx)
+        duuren = sorted(duur_naar_codes.keys())
+
+        n_stemmen = max(len(m) for m in per_maat)
+
+        # Bouw seed (eerste N_SEED_MATEN maten) en rest per stem
+        stem_seeds:     list[list[int]]       = []
+        stem_doelduren: list[float]           = []
+        stem_rest:      list[list[VoiceToken]] = []
+        for stem_i in range(n_stemmen):
+            seed_tok = [
+                t for maat in per_maat[:N_SEED_MATEN]
+                for t in (maat[stem_i] if stem_i < len(maat) else [])
+            ]
+            rest_tok = [
+                t for maat in per_maat[N_SEED_MATEN:]
+                for t in (maat[stem_i] if stem_i < len(maat) else [])
+            ]
+            stem_seeds.append([vocab[t] for t in seed_tok if t in vocab])
+            stem_doelduren.append(sum(d for _, d in rest_tok))
+            stem_rest.append(rest_tok)
+
+        # ── Fase 1: model genereert ritme vrij ────────────────────────────────
+        st.write("**Fase 1 — Ritme genereren (Bach-stijl)**")
+        ritmes: list[list[float]] = []
+        for stem_i in range(n_stemmen):
+            seeds    = stem_seeds[stem_i]
+            doelduur = stem_doelduren[stem_i]
+            if len(seeds) < venster or doelduur == 0:
+                # Onvoldoende seed of geen doelduur: gebruik origineel ritme als fallback
+                ritmes.append([d for _, d in stem_rest[stem_i]])
+                st.write(f"  Stem {stem_i + 1}: origineel ritme als fallback")
+                continue
+            duur_seq = _genereer_ritme(
+                model, seeds, doelduur,
+                duur_naar_codes, duuren,
+                venster, temperatuur, top_k,
+            )
+            ritmes.append(duur_seq)
+            schema = "  ".join(str(d) for d in duur_seq[:12])
+            suffix = "…" if len(duur_seq) > 12 else ""
+            st.write(
+                f"  Stem {stem_i + 1}: `{schema}{suffix}`  "
+                f"({len(duur_seq)} noten, {sum(duur_seq):.1f} kw.)"
+            )
+
+        # ── Fase 2: model genereert pitches vrij (geen toonaard-filter) ───────
+        st.write("**Fase 2 — Melodie genereren (model bepaalt toonaard)**")
+        ai_stemmen: list[list[VoiceToken]] = []
+        for stem_i in range(n_stemmen):
+            seeds = stem_seeds[stem_i]
+            if len(seeds) < venster or not ritmes[stem_i]:
+                ai_stemmen.append(stem_rest[stem_i])
+                continue
+            st.write(f"  Stem {stem_i + 1}…")
+            melodie = _genereer_melodie(
+                model, seeds, ritmes[stem_i],
+                duur_naar_codes, inv_vocab,
+                venster, temperatuur, top_k,
+                toegestane_pitchklassen=None,   # geen filter: model bepaalt zelf de toonaard
+            )
+            ai_stemmen.append(melodie)
+
+        st.write("MIDI bouwen…")
+        with open(midi_pad, "rb") as f:
+            origineel_b64 = base64.b64encode(f.read()).decode()
+
+        ai_b64 = _eerste_helft_plus_ai_b64(midi_pad, N_SEED_MATEN, ai_stemmen)
+
+        bpm = _tempo_uit_midi(midi_pad)
+        SPQ = 60.0 / bpm
+        maat_starts_s: list[float] = []
+        cumulatief = 0.0
+        for maat in per_maat:
+            maat_starts_s.append(round(cumulatief * SPQ, 4))
+            if maat:
+                for _, duur in maat[0]:
+                    cumulatief += duur
+
+        st.session_state.update({
+            "vrij_origineel_b64": origineel_b64,
+            "vrij_ai_b64":        ai_b64,
+            "vrij_song":          song_naam,
+            "vrij_seed_maten":    N_SEED_MATEN,
+            "vrij_totaal_maten":  n_maten,
+            "vrij_nieuwe_tokens": sum(len(s) for s in ai_stemmen),
+            "vrij_maat_starts_s": maat_starts_s,
+        })
+
+        status.update(label="Klaar!", state="complete")
+
+
+def _toon_vrij_resultaat() -> None:
+    """Toon het resultaat van de Bach-stijl modus.
+
+    Leest de gegenereerde MIDI uit st.session_state en toont:
+      - Vier metrics: totaal maten, seed-bereik, gegenereerd bereik, token-count
+      - Een visuele splitsbalk (blauw = seed, geel = AI)
+      - Twee piano-rolls: origineel vs. Bach-stijl aanvulling
+    """
+    st.divider()
+
+    sm = st.session_state["vrij_seed_maten"]
+    tm = st.session_state["vrij_totaal_maten"]
+    nt = st.session_state["vrij_nieuwe_tokens"]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Totaal maten",       tm)
+    c2.metric("Seed (origineel)",   f"maat 1 – {sm}")
+    c3.metric("Gegenereerd (AI)",   f"maat {sm + 1} – {tm}")
+    c4.metric("Tokens gegenereerd", nt)
+
+    frac = sm / tm
+    st.markdown(
+        f"""
+        <div style="display:flex;height:10px;border-radius:6px;overflow:hidden;margin:6px 0 14px">
+          <div style="flex:{frac};background:#38bdf8;"></div>
+          <div style="flex:{1-frac};background:#f59e0b;"></div>
+        </div>
+        <div style="display:flex;font-size:12px;color:#94a3b8;margin-bottom:10px">
+          <div style="flex:{frac}">🔵 Seed (maat 1–{sm})</div>
+          <div style="flex:{1-frac};text-align:right">🟡 Bach-stijl AI (maat {sm+1}–{tm})</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    col1, col2 = st.columns(2)
+    maat_starts = st.session_state.get("vrij_maat_starts_s", [])
+
+    with col1:
+        st.subheader("🎼 Origineel")
+        st.caption(f"Alle {tm} maten origineel")
+        st.components.v1.html(
+            _piano_roll_html(
+                st.session_state["vrij_origineel_b64"],
+                hoogte=300, uid="vorig",
+                maat_starts_s=maat_starts,
+                totaal_maten=tm, helft_maten=sm,
+                is_ai=False,
+            ),
+            height=420, scrolling=False,
+        )
+
+    with col2:
+        st.subheader("🤖 Bach-stijl aanvulling")
+        st.caption(f"Maat 1–{sm} · origineel  +  maat {sm+1}–{tm} · Bach-stijl AI")
+        st.components.v1.html(
+            _piano_roll_html(
+                st.session_state["vrij_ai_b64"],
+                hoogte=300, uid="vai",
+                maat_starts_s=maat_starts,
+                totaal_maten=tm, helft_maten=sm,
                 is_ai=True,
             ),
             height=420, scrolling=False,

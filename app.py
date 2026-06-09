@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import sys
 import tempfile
 from pathlib import Path
 
@@ -21,15 +22,52 @@ import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DATA_DIR = PROJECT_ROOT / "data"
-CSV_PATH = DATA_DIR / "processed" / "bach_analyse.csv"
-RAW_DIR = DATA_DIR / "raw" / "bach"
+CSV_PATH = DATA_DIR / "processed" / "bach_analyse.csv"   # gegenereerd door analyse_midi.py
+RAW_DIR  = DATA_DIR / "raw" / "bach"                     # ruwe .mid en .xml bestanden
+
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 
 # ---------------------------------------------------------------------------
 # Data & conversies (gecached)
 # ---------------------------------------------------------------------------
 
+def _zorg_voor_data() -> bool:
+    """Download en analyseer de Bach-data automatisch als die nog niet aanwezig is."""
+    midi_bestanden = list(RAW_DIR.glob("*.mid"))
+
+    if not midi_bestanden:
+        st.info(
+            "Het Bach-corpus is nog niet gedownload. "
+            "Dit gebeurt automatisch — even geduld (enkele minuten)…"
+        )
+        with st.spinner("Bach-corpus downloaden via music21…"):
+            try:
+                from download_bach import download_bach_corpus
+                download_bach_corpus()
+            except Exception as e:
+                st.error(f"Download mislukt: {e}")
+                return False
+
+    if not CSV_PATH.exists():
+        with st.spinner("MIDI-bestanden analyseren…"):
+            try:
+                from analyse_midi import analyseer
+                analyseer()
+            except Exception as e:
+                st.error(f"Analyse mislukt: {e}")
+                return False
+
+    return True
+
+
 @st.cache_data
 def laad_data() -> pd.DataFrame:
+    """Lees de analyse-CSV en zorg dat de kolom 'bestandsnaam' altijd aanwezig is.
+
+    De CSV bevat per Bach-werk: naam (BWV), classificatie, maten, stemmen, enz.
+    Als 'bestandsnaam' ontbreekt (oudere CSV-versie), wordt die afgeleid uit 'naam'.
+    Resultaat wordt gecached zodat de CSV niet bij elke Streamlit-rerun opnieuw wordt geladen.
+    """
     df = pd.read_csv(CSV_PATH)
     if "bestandsnaam" not in df.columns:
         df["bestandsnaam"] = df["naam"] + ".mid"
@@ -38,17 +76,36 @@ def laad_data() -> pd.DataFrame:
 
 @st.cache_data
 def laad_gefilterde_midi_b64(midi_pad: str, geselecteerde_indices: tuple[int, ...]) -> str:
-    """MIDI-bestand inlezen, alleen gevraagde tracks behouden, base64 teruggeven."""
+    """Lees een MIDI-bestand en geef alleen de gevraagde stems terug als base64-string.
+
+    Als alle stemmen geselecteerd zijn, wordt het originele bestand direct base64-gecodeerd
+    (geen onnodige herverwerking via music21).
+    Als een subset geselecteerd is, hercomponeert music21 een nieuw MIDI-bestand in RAM
+    met alleen de gevraagde Parts — er wordt niets naar disk geschreven.
+
+    Parameters
+    ----------
+    midi_pad:
+        Absoluut pad naar het .mid-bestand.
+    geselecteerde_indices:
+        Tuple van nul-gebaseerde indices van de Parts die bewaard moeten worden.
+
+    Returns
+    -------
+    Base64-gecodeerde string van de (gefilterde) MIDI.
+    """
     from music21 import converter, stream
     from music21.midi import translate as midi_translate
 
     partituur = converter.parse(midi_pad)
     delen = list(partituur.parts)
 
+    # Optimalisatie: als alle stemmen gevraagd zijn, codeer het bestand direct
     if not geselecteerde_indices or set(geselecteerde_indices) == set(range(len(delen))):
         with open(midi_pad, "rb") as f:
             return base64.b64encode(f.read()).decode()
 
+    # Bouw een nieuwe Score met alleen de gevraagde Parts
     gefilterd = stream.Score()
     for i in geselecteerde_indices:
         if i < len(delen):
@@ -60,11 +117,35 @@ def laad_gefilterde_midi_b64(midi_pad: str, geselecteerde_indices: tuple[int, ..
 
 @st.cache_data
 def laad_abc(naam: str, geselecteerde_indices: tuple[int, ...]) -> str | None:
-    """MusicXML of MIDI omzetten naar ABC-notatie voor abcjs."""
+    """Converteer een Bach-werk naar ABC-notatie voor bladmuziekweergave met abcjs.
+
+    Probeert eerst het MusicXML-bestand te laden (rijkere structuurinformatie:
+    sleutels, maatsoorten, dynamiek). Valt terug op het MIDI-bestand als XML
+    niet beschikbaar is.
+
+    ABC-notatie is een tekstformaat dat door de JavaScript-bibliotheek abcjs
+    rechtstreeks in de browser als bladmuziek wordt getekend.
+
+    De conversie verloopt via een tijdelijk .abc-bestand op disk omdat music21's
+    write("abc", ...) een bestandspad vereist. Het tijdelijke bestand wordt
+    altijd verwijderd in de finally-clausule.
+
+    Parameters
+    ----------
+    naam:
+        BWV-naam zonder extensie, bijv. "bwv227.11".
+    geselecteerde_indices:
+        Tuple van indices van de Parts die in de partituur getoond moeten worden.
+
+    Returns
+    -------
+    ABC-string of None als de conversie mislukt.
+    """
     from music21 import converter, stream
 
-    xml_pad = RAW_DIR / f"{naam}.xml"
+    xml_pad  = RAW_DIR / f"{naam}.xml"
     midi_pad = RAW_DIR / f"{naam}.mid"
+    # XML heeft de voorkeur vanwege rijkere muzikale informatie
     bron = str(xml_pad) if xml_pad.exists() else str(midi_pad)
 
     try:
@@ -72,6 +153,7 @@ def laad_abc(naam: str, geselecteerde_indices: tuple[int, ...]) -> str | None:
     except Exception:
         return None
 
+    # Filter op geselecteerde stemmen indien nodig
     delen = list(partituur.parts)
     if geselecteerde_indices and set(geselecteerde_indices) != set(range(len(delen))):
         gefilterd = stream.Score()
@@ -82,6 +164,7 @@ def laad_abc(naam: str, geselecteerde_indices: tuple[int, ...]) -> str | None:
 
     tmp_path = None
     try:
+        # music21 vereist een bestandspad voor ABC-export; schrijf tijdelijk bestand
         with tempfile.NamedTemporaryFile(suffix=".abc", delete=False, mode="w", encoding="utf-8") as tmp:
             tmp_path = tmp.name
         partituur.write("abc", fp=tmp_path)
@@ -90,6 +173,7 @@ def laad_abc(naam: str, geselecteerde_indices: tuple[int, ...]) -> str | None:
     except Exception:
         return None
     finally:
+        # Ruim altijd op, ook bij een fout
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
@@ -98,6 +182,7 @@ def laad_abc(naam: str, geselecteerde_indices: tuple[int, ...]) -> str | None:
 # HTML-componenten
 # ---------------------------------------------------------------------------
 
+# CDN-bundel die Tone.js, Magenta en html-midi-player in één request laadt
 _MIDI_CDN = (
     "https://cdn.jsdelivr.net/combine/"
     "npm/tone@14,"
@@ -109,6 +194,26 @@ _ABCJS_CSS = "https://cdn.jsdelivr.net/npm/abcjs@6.4.4/abcjs-audio.css"
 
 
 def piano_roll_html(midi_b64: str, hoogte: int = 300) -> str:
+    """Genereer een volledig HTML-document met een interactieve piano-roll speler.
+
+    Gebruikt de html-midi-player webcomponent (via CDN). De MIDI-data wordt als
+    een data-URI direct in de HTML ingebed — er gaat geen verzoek terug naar de
+    Streamlit-server bij het afspelen of downloaden.
+
+    De <midi-player> biedt een afspeelknop en een ingebouwde downloadknop.
+    De <midi-visualizer> tekent de noten als gekleurde balkjes (piano-roll stijl).
+
+    Parameters
+    ----------
+    midi_b64:
+        Base64-gecodeerde MIDI-data.
+    hoogte:
+        Pixelhoogte van de piano-roll visualisatie.
+
+    Returns
+    -------
+    HTML-string die via st.components.v1.html() in Streamlit kan worden gerenderd.
+    """
     return f"""<!DOCTYPE html><html><head>
 <script src="{_MIDI_CDN}"></script>
 <style>
@@ -134,6 +239,27 @@ def piano_roll_html(midi_b64: str, hoogte: int = 300) -> str:
 
 
 def partituur_html(abc_string: str) -> str:
+    """Genereer een HTML-document dat bladmuziek toont via de abcjs-bibliotheek.
+
+    De ABC-notatie wordt door abcjs omgezet naar SVG-bladmuziek in de browser.
+    Tijdens het afspelen worden de gespeelde noten geel gemarkeerd via de
+    cursorBeheer-callback die abcjs aanroept op elk notevent.
+
+    Werking:
+      1. ABCJS.renderAbc() tekent de noten als SVG en geeft een visualObject terug.
+      2. SynthController laadt het visualObject en toont een audiospeler.
+      3. De onEvent-callback voegt de CSS-klasse 'actief' toe aan de huidige noten
+         en verwijdert die van de vorige.
+
+    Parameters
+    ----------
+    abc_string:
+        Geldige ABC-notatie, bijv. gegenereerd door music21's write("abc", ...).
+
+    Returns
+    -------
+    HTML-string die via st.components.v1.html() in Streamlit kan worden gerenderd.
+    """
     # json.dumps escapet alle speciale tekens veilig voor een JS-string-literal
     abc_js = json.dumps(abc_string)
 
@@ -214,6 +340,16 @@ if (ABCJS.synth.supportsAudio()) {{
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    """Hoofdfunctie van de Streamlit-overzichtspagina.
+
+    Opbouw van de pagina:
+      1. Laad de analyse-CSV en toon een filterbare tabel met alle Bach-werken.
+      2. Na het selecteren van een rij worden metadata-metrics getoond.
+      3. De gebruiker kiest welke stemmen afgespeeld worden via een multiselect.
+      4. Twee tabs bieden:
+           - Partituur: bladmuziek via ABC/abcjs (met afspeelcursor)
+           - Piano Roll: interactieve piano-roll via html-midi-player
+    """
     st.set_page_config(
         page_title="Bach — Muziekoverzicht",
         page_icon="🎵",
@@ -221,11 +357,7 @@ def main() -> None:
     )
     st.title("🎵 Bach Muziekoverzicht")
 
-    if not CSV_PATH.exists():
-        st.error(
-            f"Analyse-CSV niet gevonden: `{CSV_PATH}`\n\n"
-            "Voer eerst uit:  `python scripts/analyse_midi.py`"
-        )
+    if not _zorg_voor_data():
         return
 
     df = laad_data()
@@ -288,7 +420,7 @@ def main() -> None:
     c3.metric("Categorie", rij["classificatie"])
     c4.metric("Bestand",   rij["bestandsnaam"])
 
-    # Stemnamen bepalen
+    # Stemnamen bepalen: uit CSV of genummerd als fallback
     stemmen_val = rij.get("stemmen", "")
     if pd.notna(stemmen_val) and str(stemmen_val).strip():
         stem_namen = [s.strip() for s in str(stemmen_val).split("|")]

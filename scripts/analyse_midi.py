@@ -15,11 +15,11 @@ import csv
 import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT  = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-DATA_DIR = PROJECT_ROOT / "data"
-RAW_DIR = DATA_DIR / "raw" / "bach"
+DATA_DIR      = PROJECT_ROOT / "data"
+RAW_DIR       = DATA_DIR / "raw" / "bach"
 PROCESSED_DIR = DATA_DIR / "processed"
 
 
@@ -28,8 +28,38 @@ PROCESSED_DIR = DATA_DIR / "processed"
 # ---------------------------------------------------------------------------
 
 def _classificeer(naam: str, aantal_stemmen: int) -> str:
-    """Bepaal het genre op basis van BWV-nummer en stemmencount."""
-    kern = naam.lower().replace("bwv", "")
+    """Bepaal het muzikale genre op basis van het BWV-nummer en het stemmencount.
+
+    De classificatie gebruikt de officiële BWV-indeling:
+      - BWV 1–224:      cantates (vocale werken voor de kerkdienst)
+                        Uitzondering: als de beweging ≥ 4 is én 4 stemmen heeft,
+                        is het vrijwel zeker een slotzang (koraal).
+      - BWV 225–231:    motetten (a capella koormuziek)
+      - BWV 232–236:    missen
+      - BWV 237–243:    Sanctus-zettingen
+      - BWV 244:        Matthäus-Passion
+      - BWV 245:        Johannes-Passion
+      - BWV 247:        Markus-Passion
+      - BWV 248:        Kerstoratorium
+      - BWV 249:        Paasoratorium
+      - BWV 250–438:    koralen (vierstemmige harmonisaties)
+      - overig:         alles buiten bovenstaande reeksen
+
+    De bewegingsnummer wordt afgeleid uit het deel na de punt in de naam,
+    bijv. "bwv227.11" → BWV 227, beweging 11.
+
+    Parameters
+    ----------
+    naam:
+        BWV-bestandsnaam zonder extensie, bijv. "bwv10.7" of "bwv227.11".
+    aantal_stemmen:
+        Aantal MIDI-tracks / Parts in de partituur.
+
+    Returns
+    -------
+    Classificatiestring, bijv. "koraal" of "cantate".
+    """
+    kern  = naam.lower().replace("bwv", "")
     hoofd = kern.split(".")[0].split("-")[0]
     try:
         bwv = int(hoofd)
@@ -73,18 +103,39 @@ def _classificeer(naam: str, aantal_stemmen: int) -> str:
 # ---------------------------------------------------------------------------
 
 def _analyseer_midi(midi_pad: Path) -> dict:
+    """Analyseer één MIDI-bestand en geef een rij met metadata terug.
+
+    Verloop:
+      1. Parseer het MIDI-bestand via music21.
+      2. Extraheer stemnamen uit MIDI-tracknamen (partName of id).
+      3. Tel het aantal maten op basis van het eerste Part.
+      4. Classificeer het werk via _classificeer().
+
+    Bij een parse-fout wordt een fout-rij teruggegeven met de foutmelding in
+    het veld 'stemmen'. Dit voorkomt dat één corrupt bestand het hele script
+    laat crashen.
+
+    Parameters
+    ----------
+    midi_pad:
+        Absoluut pad naar het te analyseren .mid-bestand.
+
+    Returns
+    -------
+    Dict met de kolommen: naam, bestandsnaam, classificatie, maten,
+    aantal_stemmen, stemmen.
+    """
     from music21 import converter
 
     naam = midi_pad.stem
     try:
-        partituur = converter.parse(str(midi_pad))
-        delen = partituur.parts
-        aantal_stemmen = len(delen)
+        partituur       = converter.parse(str(midi_pad))
+        delen           = partituur.parts
+        aantal_stemmen  = len(delen)
 
-        # Stemnamen (MIDI-tracknaam, anders fallback)
+        # Stemnamen ophalen: MIDI-tracknaam heeft prioriteit, anders generiek label
         stem_namen = []
         for i, deel in enumerate(delen):
-            # music21 slaat de MIDI-tracknaam op in partName of id
             naam_deel = (
                 getattr(deel, "partName", None)
                 or getattr(deel, "id", None)
@@ -92,7 +143,7 @@ def _analyseer_midi(midi_pad: Path) -> dict:
             )
             stem_namen.append(str(naam_deel).strip())
 
-        # Maten tellen op basis van het eerste deel
+        # Maten tellen op basis van het eerste Part (stemmen kunnen lengte verschillen)
         eerste_deel = delen[0] if delen else None
         maten = (
             len(eerste_deel.getElementsByClass("Measure")) if eerste_deel else 0
@@ -101,22 +152,23 @@ def _analyseer_midi(midi_pad: Path) -> dict:
         classificatie = _classificeer(naam, aantal_stemmen)
 
         return {
-            "naam": naam,
-            "bestandsnaam": midi_pad.name,
-            "classificatie": classificatie,
-            "maten": maten,
+            "naam":           naam,
+            "bestandsnaam":   midi_pad.name,
+            "classificatie":  classificatie,
+            "maten":          maten,
             "aantal_stemmen": aantal_stemmen,
-            "stemmen": " | ".join(stem_namen),
+            "stemmen":        " | ".join(stem_namen),
         }
 
     except Exception as fout:
+        # Fout-rij: alle velden leeg behalve naam/bestandsnaam en foutmelding
         return {
-            "naam": naam,
-            "bestandsnaam": midi_pad.name,
-            "classificatie": "fout",
-            "maten": "",
+            "naam":           naam,
+            "bestandsnaam":   midi_pad.name,
+            "classificatie":  "fout",
+            "maten":          "",
             "aantal_stemmen": "",
-            "stemmen": f"FOUT: {fout}",
+            "stemmen":        f"FOUT: {fout}",
         }
 
 
@@ -125,6 +177,19 @@ def _analyseer_midi(midi_pad: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 def _voortgangsbalk(huidig: int, totaal: int, breedte: int = 40) -> str:
+    """Genereer een ASCII-voortgangsbalk voor terminal-uitvoer.
+
+    Voorbeeld output:  [████████████░░░░░░░░░░░░░░░░░░░░░░░░░░░░]  42/400
+
+    Parameters
+    ----------
+    huidig:
+        Huidige iteratieteller (1-gebaseerd).
+    totaal:
+        Totaal aantal iteraties.
+    breedte:
+        Breedte van de balk in tekens (standaard 40).
+    """
     gevuld = int(breedte * huidig / totaal)
     balk = "█" * gevuld + "░" * (breedte - gevuld)
     return f"[{balk}] {huidig:3d}/{totaal}"
@@ -135,6 +200,20 @@ def _voortgangsbalk(huidig: int, totaal: int, breedte: int = 40) -> str:
 # ---------------------------------------------------------------------------
 
 def analyseer(max_bestanden: int | None = None) -> None:
+    """Analyseer alle MIDI-bestanden in RAW_DIR en schrijf de resultaten naar CSV.
+
+    Verloop:
+      1. Zoek alle .mid-bestanden in data/raw/bach/ (gesorteerd op naam).
+      2. Analyseer elk bestand via _analyseer_midi().
+      3. Toon per classificatie hoeveel werken gevonden zijn.
+      4. Schrijf alle rijen naar data/processed/bach_analyse.csv.
+
+    Parameters
+    ----------
+    max_bestanden:
+        Verwerk maximaal dit aantal bestanden. None = alles.
+        Handig voor snelle tests zonder het volledige corpus te verwerken.
+    """
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
     midi_bestanden = sorted(RAW_DIR.glob("*.mid"))
@@ -150,7 +229,7 @@ def analyseer(max_bestanden: int | None = None) -> None:
     print(f"🎵 {totaal} MIDI-bestanden gevonden in {RAW_DIR}\n")
 
     resultaten: list[dict] = []
-    fouten: list[str] = []
+    fouten:     list[str]  = []
 
     for i, pad in enumerate(midi_bestanden, start=1):
         print(f"\r{_voortgangsbalk(i, totaal)}  {pad.stem:<45}", end="", flush=True)
@@ -161,15 +240,15 @@ def analyseer(max_bestanden: int | None = None) -> None:
 
     print(f"\r{_voortgangsbalk(totaal, totaal)}  {'Klaar!':<45}\n")
 
-    # Samenvatting per classificatie
+    # Samenvatting per classificatie tonen in terminal
     from collections import Counter
     tellers = Counter(r["classificatie"] for r in resultaten)
     print("Overzicht per categorie:")
     for cat, n in sorted(tellers.items(), key=lambda x: -x[1]):
         print(f"  {cat:<30} {n:>4} werken")
 
-    # CSV schrijven
-    csv_pad = PROCESSED_DIR / "bach_analyse.csv"
+    # CSV schrijven met vaste kolomvolgorde
+    csv_pad  = PROCESSED_DIR / "bach_analyse.csv"
     kolommen = ["naam", "bestandsnaam", "classificatie", "maten", "aantal_stemmen", "stemmen"]
     with open(csv_pad, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=kolommen)
@@ -186,6 +265,11 @@ def analyseer(max_bestanden: int | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 def _parseer_args() -> argparse.Namespace:
+    """Parseer command-line argumenten voor het analyse-script.
+
+    Beschikbare opties:
+      --max N    Verwerk maximaal N bestanden (handig voor testen).
+    """
     parser = argparse.ArgumentParser(
         description="Analyseer Bach MIDI-bestanden op maten, stemmen en genre.",
         formatter_class=argparse.RawDescriptionHelpFormatter,

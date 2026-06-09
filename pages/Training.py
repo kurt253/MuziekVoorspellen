@@ -22,7 +22,9 @@ ANALYSE_CSV  = DATA_DIR / "processed" / "bach_analyse.csv"
 METADATA_CSV = DATA_DIR / "processed" / "bach_metadata.csv"
 MODEL_DIR    = DATA_DIR / "processed"
 
-# ── Constanten (uit notebook) ─────────────────────────────────────────────────
+# ── Constanten ────────────────────────────────────────────────────────────────
+
+# Alle ondersteunde muzikale genres voor het trainingsfilter
 BEKENDE_TYPES = [
     "koraal",
     "koraal (cantate)",
@@ -35,15 +37,29 @@ BEKENDE_TYPES = [
     "overige",
 ]
 
+# Toegestane nootdurations in kwartnootheden.
+# Durations buiten deze lijst worden afgerond naar de dichtstbijzijnde waarde.
 DUREN = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
 
 
 # ── Data ──────────────────────────────────────────────────────────────────────
+
 @st.cache_data
 def _laad_alles() -> pd.DataFrame:
+    """Laad en merge de analyse- en metadata-CSV's tot één werkend DataFrame.
+
+    Combineert:
+      - bach_analyse.csv: classificatie, maten, stemnamen
+      - bach_metadata.csv: absoluut MIDI-pad, BPM, toonsoort
+
+    De midi_pad kolom wordt omgezet van relatief (t.o.v. data/) naar absoluut.
+    Resultaat gecached om herhaald inlezen bij Streamlit-reruns te vermijden.
+    """
     analyse  = pd.read_csv(ANALYSE_CSV)
     metadata = pd.read_csv(METADATA_CSV)
     metadata["midi_pad"] = metadata["midi_pad"].apply(lambda p: str(DATA_DIR / p))
+    # Verwijder kolommen uit metadata die al in analyse zitten om _x/_y-suffixen te voorkomen
+    metadata = metadata.drop(columns=["maten", "stemmen"], errors="ignore")
     return (
         analyse.merge(metadata, on="naam", how="inner")
         .drop(columns=["bestandsnaam"], errors="ignore")
@@ -51,16 +67,52 @@ def _laad_alles() -> pd.DataFrame:
 
 
 # ── MIDI-verwerking ───────────────────────────────────────────────────────────
-# VoiceToken = (midi_pitch, duur)  waarbij pitch=0 = rust
+
+# Type alias: een token is een (MIDI-pitch, duur)-paar.
+# pitch 0 stelt een rust voor; duur is in kwartnootheden.
 VoiceToken = tuple[int, float]
 
+
 def _kwantiseer_duur(duur: float) -> float:
+    """Rond een willekeurige duur af naar de dichtstbijzijnde waarde uit DUREN.
+
+    MIDI-bestanden kunnen micro-timings bevatten (bijv. 0.99 i.p.v. 1.0) door
+    quantisatieruis. Deze functie normaliseert zulke waarden naar het vaste
+    duratierooster zodat het vocabulaire compact en consistent blijft.
+
+    Parameters
+    ----------
+    duur:
+        Originele duur in kwartnootheden.
+
+    Returns
+    -------
+    Dichtstbijzijnde waarde uit DUREN.
+    """
     return min(DUREN, key=lambda d: abs(d - duur))
 
 
 def _midi_naar_stemmen(pad: str) -> list[list[VoiceToken]]:
-    """Parseer MIDI naar afzonderlijke stemmen als (pitch, duur) tokens."""
+    """Parseer één MIDI-bestand naar een lijst van stemmen als VoiceToken-reeksen.
+
+    Elke stem (Part) levert een vlakke lijst van tokens op. Rusten krijgen
+    pitch 0. Bij een akkoord (Chord) wordt alleen de hoogste noot gebruikt —
+    dit vereenvoudigt het vocabulaire aanzienlijk zonder veel muzikale
+    informatie te verliezen voor de melodielijn.
+
+    Lege stemmen (geen tokens na parsing) worden weggelaten.
+
+    Parameters
+    ----------
+    pad:
+        Absoluut of relatief pad naar het .mid-bestand.
+
+    Returns
+    -------
+    Lijst van stemmen, elke stem is een lijst van (pitch, duur)-tuples.
+    """
     from music21 import converter, note, chord
+
     score   = converter.parse(pad)
     stemmen: list[list[VoiceToken]] = []
     for part in score.parts:
@@ -74,6 +126,7 @@ def _midi_naar_stemmen(pad: str) -> list[list[VoiceToken]]:
             elif isinstance(el, note.Note):
                 tokens.append((el.pitch.midi, duur))
             elif isinstance(el, chord.Chord):
+                # Gebruik alleen de hoogste noot van het akkoord
                 tokens.append((max(p.midi for p in el.pitches), duur))
         if tokens:
             stemmen.append(tokens)
@@ -81,6 +134,23 @@ def _midi_naar_stemmen(pad: str) -> list[list[VoiceToken]]:
 
 
 def _bouw_vocab(df: pd.DataFrame) -> dict[VoiceToken, int]:
+    """Bouw het vocabulaire op uit alle stemmen van alle geselecteerde werken.
+
+    Het vocabulaire is een mapping van unieke (pitch, duur)-tokens naar
+    integers. Deze integers zijn de invoer/uitvoer van het LSTM-model.
+
+    Werken die niet geparsed kunnen worden, worden stilzwijgend overgeslagen
+    zodat één corrupt bestand de training niet blokkeert.
+
+    Parameters
+    ----------
+    df:
+        DataFrame met minimaal een 'midi_pad'-kolom.
+
+    Returns
+    -------
+    Dict van VoiceToken → integer index, gesorteerd voor determinisme.
+    """
     tokens: set[VoiceToken] = set()
     for pad in df["midi_pad"]:
         try:
@@ -94,7 +164,33 @@ def _bouw_vocab(df: pd.DataFrame) -> dict[VoiceToken, int]:
 def _df_naar_reeksen(
     df: pd.DataFrame, vocab: dict[VoiceToken, int], venster: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Alle stemmen van alle MIDI-bestanden → trainingssequenties."""
+    """Converteer alle stemmen van alle werken naar overlappende trainingssequenties.
+
+    Voor elke stem wordt een sliding-window toegepast met stapgrootte 1:
+      tokens = [t0, t1, t2, t3, t4, ...]
+      venster = 4:
+        X[0] = [t0, t1, t2, t3],  y[0] = t4
+        X[1] = [t1, t2, t3, t4],  y[1] = t5
+        ...
+
+    Tokens die niet in het vocabulaire staan (bijv. door een corrupt bestand
+    dat wel geparsed werd maar afwijkende tokens bevat) worden overgeslagen.
+
+    Parameters
+    ----------
+    df:
+        DataFrame met 'midi_pad'-kolom.
+    vocab:
+        Vocabulaire dict zoals teruggegeven door _bouw_vocab().
+    venster:
+        Lengte van elke invoersequentie (context voor het model).
+
+    Returns
+    -------
+    Tuple (X, y) als numpy-arrays van dtype int64.
+    X.shape = (N, venster), y.shape = (N,)
+    Als er geen data is, worden lege arrays teruggegeven.
+    """
     alle_X, alle_y = [], []
     for _, rij in df.iterrows():
         try:
@@ -110,8 +206,34 @@ def _df_naar_reeksen(
     return np.array(alle_X, dtype=np.int64), np.array(alle_y, dtype=np.int64)
 
 
-# ── Model (uit notebook) ──────────────────────────────────────────────────────
+# ── Model ─────────────────────────────────────────────────────────────────────
+
 class LSTMModel(nn.Module):
+    """LSTM-taalmodel voor muziekgeneratie op token-niveau.
+
+    Architectuur:
+      Embedding → LSTM (meerdere lagen) → Dropout → Fully Connected
+
+    Het model leert de conditionele kansverdeling P(token_t | token_{t-venster}, …, token_{t-1}).
+    Tijdens generatie wordt de laatste tijdstap van de LSTM-uitvoer gebruikt
+    (out[:, -1, :]) als representatie van de hele context.
+
+    Parameters
+    ----------
+    vocab:
+        Vocabulairegrootte (aantal unieke tokens).
+    embed_dim:
+        Dimensie van de tokenembedding (standaard 64).
+    hidden:
+        Aantal hidden units per LSTM-laag (standaard 256).
+    lagen:
+        Aantal gestapelde LSTM-lagen (standaard 2).
+    dropout:
+        Dropout-kans toegepast na de laatste LSTM-laag én tussen lagen
+        (bij lagen > 1). Bij één laag is inter-laag-dropout uitgeschakeld
+        omdat PyTorch dat niet ondersteunt.
+    """
+
     def __init__(self, vocab: int, embed_dim: int = 64, hidden: int = 256,
                  lagen: int = 2, dropout: float = 0.3):
         super().__init__()
@@ -123,13 +245,41 @@ class LSTMModel(nn.Module):
         self.fc        = nn.Linear(hidden, vocab)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.embedding(x)
-        out, _ = self.lstm(x)
-        return self.fc(self.dropout(out[:, -1, :]))
+        """Voorwaartse pass: verwerk een batch van tokenreeksen naar logits.
+
+        Parameters
+        ----------
+        x:
+            Tensor van shape (batch, venster) met token-indices.
+
+        Returns
+        -------
+        Logits-tensor van shape (batch, vocab_grootte).
+        """
+        x = self.embedding(x)               # (batch, venster, embed_dim)
+        out, _ = self.lstm(x)               # (batch, venster, hidden)
+        return self.fc(self.dropout(out[:, -1, :]))  # (batch, vocab)
 
 
 # ── Apparaat ──────────────────────────────────────────────────────────────────
+
 def _kies_apparaat() -> torch.device:
+    """Detecteer het snelste beschikbare rekenpparaat voor PyTorch.
+
+    Volgorde van voorkeur:
+      1. Intel Arc GPU via intel_extension_for_pytorch (XPU)
+         — laadt de benodigde DLL's handmatig voor Windows-compatibiliteit.
+      2. NVIDIA GPU via CUDA.
+      3. CPU als fallback.
+
+    De versiecheck voor IPEX vergelijkt alleen de hoofd- en subversie
+    (bijv. "2.1") zodat kleine patch-verschillen geen mismatch veroorzaken.
+
+    Returns
+    -------
+    torch.device object: "xpu", "cuda" of "cpu".
+    """
+    # Laad Intel GPU DLL's op Windows (vereist voor XPU-ondersteuning)
     for dll_pad in glob.glob(
         r"C:\Windows\System32\DriverStore\FileRepository\iigd_dch.inf_amd64_*\igc64.dll"
     ):
@@ -141,6 +291,7 @@ def _kies_apparaat() -> torch.device:
         import importlib.metadata as im
         tv = im.version("torch").split("+")[0]
         iv = im.version("intel_extension_for_pytorch").split("+")[0]
+        # Controleer of hoofd + subversie overeenkomen (bijv. "2.1" == "2.1")
         if ".".join(tv.split(".")[:2]) == ".".join(iv.split(".")[:2]):
             import intel_extension_for_pytorch as ipex  # noqa: F401
             if torch.xpu.is_available():
@@ -153,7 +304,19 @@ def _kies_apparaat() -> torch.device:
 
 
 # ── Modelbeheer ───────────────────────────────────────────────────────────────
+
 def _toon_modelbeheer() -> None:
+    """Toon een overzicht van bestaande modellen met verwijderknop.
+
+    Zoekt alle lstm_*.pt-bestanden in MODEL_DIR en toont per model:
+      - Afleesbare naam (soort + aantal werken uit bestandsnaam)
+      - Bestandsnaam en -grootte in MB
+      - Aanmaaktijdstip
+      - Knop om model én bijbehorend vocab-bestand te verwijderen
+
+    Na verwijdering wordt st.rerun() aangeroepen zodat de lijst meteen
+    bijgewerkt wordt.
+    """
     import re as _re
     from datetime import datetime
 
@@ -167,11 +330,11 @@ def _toon_modelbeheer() -> None:
     for model_pad in modellen:
         vocab_pad = model_pad.with_name(model_pad.stem + "_vocab.pkl")
 
-        # Bestandsinfo
+        # Bestandsinfo ophalen
         mtime = datetime.fromtimestamp(model_pad.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
         mb    = model_pad.stat().st_size / 1024 / 1024
 
-        # Naam uit bestandsnaam afleiden
+        # Leesbare naam afleiden uit bestandsnaam: lstm_<soort>_<n>.pt
         m = _re.match(r"lstm_(.+)_(\d+)\.pt$", model_pad.name)
         label = f"{m.group(1).replace('_', ' ')}  —  {m.group(2)} werken" if m else model_pad.name
 
@@ -187,7 +350,17 @@ def _toon_modelbeheer() -> None:
 
 
 # ── Scherm ────────────────────────────────────────────────────────────────────
+
 def main() -> None:
+    """Hoofdfunctie van de Streamlit-trainingspagina.
+
+    Opbouw van de pagina:
+      1. Modelbeheer: overzicht + verwijderknop voor bestaande modellen.
+      2. Selectie: kies muziektype en aantal werken via selectbox en slider.
+      3. Parameters: venster, epochs, hidden units, lagen, batchgrootte,
+         validatie-%, early stopping-geduld.
+      4. Start-knop: roept _voer_training_uit() aan en toont voortgang live.
+    """
     st.set_page_config(page_title="Training", page_icon="🎓", layout="wide")
     st.title("🎓 Model trainen")
 
@@ -220,7 +393,7 @@ def main() -> None:
             ),
         )
 
-    df_type = df_alles if soort == "alles" else df_alles[df_alles["classificatie"] == soort]
+    df_type   = df_alles if soort == "alles" else df_alles[df_alles["classificatie"] == soort]
     max_aantal = len(df_type)
 
     with col_info:
@@ -270,6 +443,7 @@ def main() -> None:
                                        help="Early stopping: stop na dit aantal epochs zonder verbetering van validatieverlies")
 
     # ── Modelbestandsnaam ─────────────────────────────────────────────────────
+    # Naam opgebouwd als: lstm_<soort>_<aantal>.pt
     soort_label = re.sub(r"[^\w]", "_", soort).strip("_")
     model_stam  = f"lstm_{soort_label}_{aantal}"
     model_pad   = MODEL_DIR / f"{model_stam}.pt"
@@ -308,13 +482,55 @@ def _voer_training_uit(
     val_split: float = 0.2,
     geduld: int = 7,
 ) -> None:
+    """Voer de volledige trainingsloop uit en sla het beste model op.
+
+    Verloop:
+      1. Bepaal het rekenpparaat (XPU / CUDA / CPU).
+      2. Bouw vocabulaire uit de geselecteerde MIDI-bestanden.
+      3. Genereer overlappende venstersequenties (X, y).
+      4. Splits in train- en validatieset (shuffled, vaste seed).
+      5. Initialiseer LSTM-model, Adam-optimizer, CrossEntropy-verlies.
+      6. Pas optioneel IPEX-optimalisatie toe bij Intel GPU.
+      7. Trainingsloop per epoch:
+           a. Forward + backward pass over trainingsbatches.
+           b. Gradient clipping (max norm 1.0) om exploderende gradiënten te voorkomen.
+           c. Validatiestap (geen gradiënten) voor vroeg-stoppingscriterium.
+           d. Sla beste model op bij verbetering van validatieverlies.
+           e. Vroeg stoppen na 'geduld' epochs zonder verbetering.
+      8. Sla beste modelgewichten op als .pt en vocabulaire als .pkl.
+      9. Toon verliesplot (train + validatie) via matplotlib.
+
+    Parameters
+    ----------
+    df_selectie:
+        DataFrame met 'midi_pad'-kolom voor de te trainen werken.
+    venster:
+        Contextlengte voor het LSTM (aantal tokens als invoer).
+    epochs:
+        Maximum aantal trainingsepochen.
+    hidden:
+        Aantal hidden units per LSTM-laag.
+    lagen:
+        Aantal gestapelde LSTM-lagen.
+    batch_grootte:
+        Aantal sequenties per mini-batch.
+    model_pad:
+        Pad waar het .pt-modelbestand opgeslagen wordt.
+    vocab_pad:
+        Pad waar het .pkl-vocabulairebestand opgeslagen wordt.
+    val_split:
+        Fractie van de data gereserveerd voor validatie (bijv. 0.2 = 20%).
+    geduld:
+        Aantal epochs zonder verbetering van validatieverlies waarna
+        vroeg gestopt wordt.
+    """
     status    = st.empty()
     voortgang = st.progress(0)
     log       = st.empty()
     train_verlies: list[float] = []
     val_verlies:   list[float] = []
 
-    # Apparaat
+    # Apparaat bepalen
     status.info("Apparaat bepalen…")
     apparaat = _kies_apparaat()
     if apparaat.type == "xpu":
@@ -325,25 +541,25 @@ def _voer_training_uit(
         apparaat_naam = "CPU"
     status.info(f"Apparaat: **{apparaat_naam}**")
 
-    # Vocabulaire
+    # Vocabulaire bouwen
     status.info("MIDI-bestanden inlezen en vocabulaire bouwen…")
     vocab = _bouw_vocab(df_selectie)
     if not vocab:
         st.error("Geen tokens gevonden — controleer de MIDI-paden.")
         return
 
-    # Sequenties
+    # Trainingssequenties aanmaken via sliding window
     status.info("Trainingssequenties aanmaken…")
     X, y = _df_naar_reeksen(df_selectie, vocab, venster)
     if len(X) == 0:
         st.error("Te weinig data voor dit venster. Verklein het venster of kies meer werken.")
         return
 
-    # Train/validatie splitsing
-    rng      = np.random.default_rng(42)
-    idx      = rng.permutation(len(X))
-    n_val    = max(1, int(len(X) * val_split))
-    idx_val  = idx[:n_val]
+    # Train/validatie splitsing met vaste seed voor reproduceerbaarheid
+    rng       = np.random.default_rng(42)
+    idx       = rng.permutation(len(X))
+    n_val     = max(1, int(len(X) * val_split))
+    idx_val   = idx[:n_val]
     idx_train = idx[n_val:]
 
     X_train, y_train = X[idx_train], y[idx_train]
@@ -356,6 +572,7 @@ def _voer_training_uit(
         f"Apparaat: **{apparaat.type.upper()}**"
     )
 
+    # pin_memory alleen bij CUDA: versnelt host→GPU data-overdracht
     gebruik_pin   = apparaat.type == "cuda"
     train_dataset = TensorDataset(torch.from_numpy(X_train), torch.from_numpy(y_train))
     val_dataset   = TensorDataset(torch.from_numpy(X_val),   torch.from_numpy(y_val))
@@ -364,11 +581,12 @@ def _voer_training_uit(
     val_lader     = DataLoader(val_dataset,   batch_size=batch_grootte, shuffle=False,
                                pin_memory=gebruik_pin, num_workers=0)
 
-    # Model
+    # Model, optimizer en verliesfunctie initialiseren
     model     = LSTMModel(len(vocab), hidden=hidden, lagen=lagen).to(apparaat)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
     criterium = nn.CrossEntropyLoss()
 
+    # Intel GPU-optimalisatie via IPEX (verbetert throughput op Arc GPU's)
     if apparaat.type == "xpu":
         try:
             import intel_extension_for_pytorch as ipex
@@ -376,10 +594,10 @@ def _voer_training_uit(
         except Exception:
             pass
 
-    beste_val      = float("inf")
-    beste_state    = None
+    beste_val        = float("inf")
+    beste_state      = None
     geen_verbetering = 0
-    vroeg_gestopt  = False
+    vroeg_gestopt    = False
 
     # Trainingslus
     status.info(f"Training: max {epochs} epochs (early stopping na {geduld} zonder verbetering)…")
@@ -391,6 +609,7 @@ def _voer_training_uit(
             optimizer.zero_grad()
             v = criterium(model(xb), yb)
             v.backward()
+            # Gradient clipping: voorkomt dat grote gradiënten de training destabiliseren
             nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             totaal += v.item() * len(xb)
@@ -398,7 +617,7 @@ def _voer_training_uit(
         gem_train = totaal / len(train_dataset)
         train_verlies.append(gem_train)
 
-        # Validatiestap
+        # Validatiestap (geen gradiënten nodig)
         model.eval()
         val_totaal = 0.0
         with torch.no_grad():
@@ -408,9 +627,10 @@ def _voer_training_uit(
         gem_val = val_totaal / len(val_dataset)
         val_verlies.append(gem_val)
 
-        # Beste model bijhouden op basis van validatieverlies
+        # Beste model bijhouden op basis van validatieverlies (niet trainverlies)
         if gem_val < beste_val:
             beste_val        = gem_val
+            # Kopieer gewichten naar CPU zodat ze bewaard blijven bij GPU-reset
             beste_state      = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             geen_verbetering = 0
             label_extra      = " ✓ beste"
@@ -425,11 +645,12 @@ def _voer_training_uit(
             f"val = `{gem_val:.4f}`{label_extra}"
         )
 
+        # Vroeg stoppen als validatieverlies 'geduld' epochs niet verbeterd is
         if geen_verbetering >= geduld:
             vroeg_gestopt = True
             break
 
-    # Beste model opslaan (laagste validatieverlies)
+    # Beste modelgewichten opslaan (niet de laatste epoch, maar de beste!)
     status.info("Beste model opslaan…")
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
     torch.save(beste_state, model_pad)
@@ -437,9 +658,11 @@ def _voer_training_uit(
         pickle.dump(vocab, f)
 
     voortgang.progress(1.0)
-    overfit = val_verlies[-1] - train_verlies[-1]
-    overfit_waarsch = "⚠️ mogelijk overfit" if overfit > 0.5 else "✅ geen overfit"
-    stop_label = (
+
+    # Overfitting-waarschuwing: groot verschil tussen val- en trainverlies
+    overfit          = val_verlies[-1] - train_verlies[-1]
+    overfit_waarsch  = "⚠️ mogelijk overfit" if overfit > 0.5 else "✅ geen overfit"
+    stop_label       = (
         f"Vroeg gestopt na **{len(train_verlies)}** epochs (geen verbetering voor {geduld} epochs)"
         if vroeg_gestopt
         else f"Voltooid na **{len(train_verlies)}** epochs"
@@ -450,7 +673,7 @@ def _voer_training_uit(
         f"Vocab: `{vocab_pad.name}`"
     )
 
-    # Verliesplot met train én validatie
+    # Verliesplot: train én validatie per epoch
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(8, 3))
     xs = range(1, len(train_verlies) + 1)

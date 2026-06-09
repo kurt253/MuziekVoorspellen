@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Muziekvoorspellen — Presentatie</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/theme/night.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/monokai.css">
+<style>
+  :root {
+    --accent:   #38bdf8;
+    --accent2:  #f59e0b;
+    --accent3:  #a78bfa;
+    --dark:     #0f172a;
+    --mid:      #1e293b;
+    --text:     #e2e8f0;
+  }
+
+  .reveal { font-family: 'Segoe UI', system-ui, sans-serif; }
+  .reveal h1, .reveal h2, .reveal h3 { font-weight: 700; letter-spacing: -0.02em; }
+  .reveal h1 { font-size: 2.4em; }
+  .reveal h2 { color: var(--accent); }
+  .reveal section { text-align: left; }
+
+  /* ── Titelpagina ─────────────────────────────────────────── */
+  .title-slide { text-align: center !important; }
+  .title-slide h1 { font-size: 3em; background: linear-gradient(135deg, var(--accent), var(--accent3)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .title-slide .sub { color: #94a3b8; font-size: 1.1em; margin-top: .4em; }
+  .title-slide .badge-row { display: flex; justify-content: center; gap: 12px; margin-top: 2em; flex-wrap: wrap; }
+  .badge { padding: 6px 18px; border-radius: 999px; font-size: .75em; font-weight: 600; letter-spacing: .05em; }
+  .badge-blue  { background: #0ea5e9; color: #fff; }
+  .badge-amber { background: #f59e0b; color: #000; }
+  .badge-purple{ background: #7c3aed; color: #fff; }
+  .badge-green { background: #10b981; color: #fff; }
+
+  /* ── Chips / Labels ──────────────────────────────────────── */
+  .chip { display: inline-block; padding: 2px 12px; border-radius: 999px; font-size: .7em; font-weight: 700; margin: 0 4px; vertical-align: middle; }
+  .chip-blue   { background: rgba(56,189,248,.2); color: var(--accent); border: 1px solid var(--accent); }
+  .chip-amber  { background: rgba(245,158,11,.2); color: var(--accent2); border: 1px solid var(--accent2); }
+  .chip-purple { background: rgba(167,139,250,.2); color: var(--accent3); border: 1px solid var(--accent3); }
+
+  /* ── Kaarten ─────────────────────────────────────────────── */
+  .card-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-top: 1em; }
+  .card { background: var(--mid); border-radius: 12px; padding: 20px 22px; border: 1px solid #334155; }
+  .card .icon { font-size: 2em; margin-bottom: .3em; }
+  .card h3 { color: var(--accent); margin: 0 0 .3em; font-size: 1em; }
+  .card p  { color: #94a3b8; font-size: .82em; margin: 0; line-height: 1.5; }
+
+  /* ── Pipeline-stroom ─────────────────────────────────────── */
+  .pipeline { display: flex; align-items: center; gap: 0; flex-wrap: wrap; margin: 1.2em 0; }
+  .pipe-step { background: var(--mid); border: 1px solid #334155; border-radius: 10px; padding: 14px 20px; flex: 1; min-width: 110px; text-align: center; }
+  .pipe-step .num { font-size: .7em; color: #64748b; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }
+  .pipe-step .lbl { font-size: .95em; font-weight: 600; color: var(--text); margin: .25em 0 .1em; }
+  .pipe-step .file { font-size: .7em; color: var(--accent); font-family: monospace; }
+  .pipe-arrow { font-size: 1.5em; color: #475569; padding: 0 6px; flex-shrink: 0; }
+
+  /* ── Twee-kolom ──────────────────────────────────────────── */
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
+  .two-col-6040 { display: grid; grid-template-columns: 3fr 2fr; gap: 28px; align-items: start; }
+
+  /* ── Stat-rij ────────────────────────────────────────────── */
+  .stat-row { display: flex; gap: 20px; flex-wrap: wrap; margin: 1em 0; }
+  .stat { background: var(--mid); border-radius: 10px; padding: 16px 22px; flex: 1; min-width: 120px; text-align: center; border: 1px solid #334155; }
+  .stat .val { font-size: 2em; font-weight: 800; color: var(--accent); line-height: 1; }
+  .stat .lbl { font-size: .75em; color: #94a3b8; margin-top: .25em; }
+
+  /* ── Token-diagram ───────────────────────────────────────── */
+  .token-box { display: inline-block; background: #0f172a; border: 1px solid var(--accent); color: var(--accent); border-radius: 6px; padding: 4px 10px; font-family: monospace; font-size: .85em; margin: 3px; }
+  .token-box.rest { border-color: #475569; color: #64748b; }
+  .token-box.arrow { border: none; color: #475569; background: none; font-size: 1.1em; }
+
+  /* ── Architectuur-blokken ────────────────────────────────── */
+  .arch { display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .arch-block { width: 260px; text-align: center; border-radius: 8px; padding: 10px; font-size: .85em; font-weight: 600; }
+  .arch-arrow { font-size: 1.2em; color: #475569; }
+  .ab-embed  { background: rgba(56,189,248,.15); border: 1px solid var(--accent); color: var(--accent); }
+  .ab-lstm   { background: rgba(167,139,250,.15); border: 1px solid var(--accent3); color: var(--accent3); }
+  .ab-drop   { background: rgba(100,116,139,.15); border: 1px solid #475569; color: #94a3b8; }
+  .ab-fc     { background: rgba(245,158,11,.15); border: 1px solid var(--accent2); color: var(--accent2); }
+  .ab-out    { background: rgba(16,185,129,.15); border: 1px solid #10b981; color: #10b981; }
+
+  /* ── Generatiemodi ───────────────────────────────────────── */
+  .mode-bar { height: 18px; border-radius: 999px; overflow: hidden; display: flex; margin: .5em 0 .25em; }
+  .mode-bar .orig { background: var(--accent); }
+  .mode-bar .ai   { background: var(--accent2); }
+
+  /* ── Quote / Highlight ───────────────────────────────────── */
+  .highlight-box { background: linear-gradient(135deg, rgba(56,189,248,.1), rgba(167,139,250,.1)); border-left: 4px solid var(--accent); border-radius: 0 10px 10px 0; padding: 18px 22px; margin: 1em 0; }
+  .highlight-box p { margin: 0; color: var(--text); font-size: .95em; line-height: 1.6; }
+
+  /* ── Tech-stack ──────────────────────────────────────────── */
+  .tech-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-top: 1em; }
+  .tech-item { background: var(--mid); border-radius: 10px; padding: 14px; text-align: center; border: 1px solid #334155; }
+  .tech-item .logo { font-size: 2em; }
+  .tech-item .name { font-size: .75em; font-weight: 700; color: var(--text); margin-top: .3em; }
+  .tech-item .role { font-size: .65em; color: #64748b; margin-top: .1em; }
+
+  /* ── Slotpagina ──────────────────────────────────────────── */
+  .end-slide { text-align: center !important; }
+  .end-slide h1 { font-size: 2.5em; background: linear-gradient(135deg, var(--accent2), var(--accent)); -webkit-background-clip: text; -webkit-text-fill-color: transparent; }
+  .cmd-box { background: #020617; border: 1px solid var(--accent); border-radius: 10px; padding: 16px 24px; display: inline-block; font-family: monospace; font-size: 1em; color: var(--accent); margin-top: 1.5em; }
+
+  /* Reveal overrides */
+  .reveal pre { width: 100%; box-shadow: none; }
+  .reveal pre code { border-radius: 10px; font-size: .78em; max-height: 420px; }
+  .reveal .progress { background: rgba(56,189,248,.2); }
+  .reveal .progress span { background: var(--accent); }
+  .reveal .controls { color: var(--accent); }
+  .small { font-size: .8em; color: #94a3b8; }
+</style>
+</head>
+<body>
+<div class="reveal">
+<div class="slides">
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 1 — Titel
+═══════════════════════════════════════════════════════════════ -->
+<section class="title-slide" data-background-gradient="radial-gradient(ellipse at 60% 40%, #0c1a3a 0%, #0f172a 70%)">
+  <div style="margin-bottom:.5em; font-size:3em;">🎵</div>
+  <h1>Muziekvoorspellen</h1>
+  <p class="sub">Bach-muziek aanvullen met een LSTM-taalmodel</p>
+  <div class="badge-row">
+    <span class="badge badge-blue">PyTorch</span>
+    <span class="badge badge-amber">music21</span>
+    <span class="badge badge-purple">Streamlit</span>
+    <span class="badge badge-green">Bach-corpus</span>
+  </div>
+  <p style="margin-top:2.5em; color:#475569; font-size:.75em;">
+    Kurt Maekelberghe &nbsp;·&nbsp; 2025–2026
+  </p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 2 — Vraagstelling
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>De vraag</h2>
+  <div class="highlight-box">
+    <p>
+      Kan een neuraal netwerk de stijl van Bach leren — en een onafgemaakt werk
+      muzikaal geloofwaardig aanvullen?
+    </p>
+  </div>
+  <div class="card-row" style="margin-top:1.5em;">
+    <div class="card">
+      <div class="icon">🎼</div>
+      <h3>Aanvulling</h3>
+      <p>Eerste helft als seed, model vult de tweede helft aan met behoud van ritme en toonaard.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🤖</div>
+      <h3>Bach-stijl</h3>
+      <p>Eerste 4 maten als seed, model genereert daarna volledig vrij — ritme én melodie.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🎹</div>
+      <h3>Meerstemmig</h3>
+      <p>Elke stem (Soprano, Alto, Tenor, Bass) wordt onafhankelijk gegenereerd.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 3 — Pipeline
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>De pipeline</h2>
+  <p class="small">Vier stappen van ruwe data naar gegenereerde muziek</p>
+
+  <div class="pipeline">
+    <div class="pipe-step">
+      <div class="num">stap 1</div>
+      <div class="lbl">📥 Download</div>
+      <div class="file">download_bach.py</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step">
+      <div class="num">stap 2</div>
+      <div class="lbl">🔍 Analyseer</div>
+      <div class="file">analyse_midi.py</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step">
+      <div class="num">stap 3</div>
+      <div class="lbl">🎓 Train</div>
+      <div class="file">Training.py</div>
+    </div>
+    <div class="pipe-arrow">→</div>
+    <div class="pipe-step">
+      <div class="num">stap 4</div>
+      <div class="lbl">🎵 Genereer</div>
+      <div class="file">Genereer.py</div>
+    </div>
+  </div>
+
+  <div class="stat-row" style="margin-top:1.5em;">
+    <div class="stat"><div class="val">400+</div><div class="lbl">Bach-werken</div></div>
+    <div class="stat"><div class="val">8</div><div class="lbl">genres</div></div>
+    <div class="stat"><div class="val">.mid + .xml</div><div class="lbl">per werk</div></div>
+    <div class="stat"><div class="val">LSTM</div><div class="lbl">model-type</div></div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 4 — Data
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Data — het Bach-corpus</h2>
+  <div class="two-col">
+    <div>
+      <p class="small" style="margin-bottom:.5em;">Genres op basis van BWV-nummer</p>
+      <table style="font-size:.78em; border-collapse:collapse; width:100%;">
+        <thead>
+          <tr style="color:#64748b; border-bottom:1px solid #334155;">
+            <th style="padding:6px 10px; text-align:left;">BWV-reeks</th>
+            <th style="padding:6px 10px; text-align:left;">Genre</th>
+          </tr>
+        </thead>
+        <tbody style="color:#cbd5e1;">
+          <tr><td style="padding:5px 10px;">1 – 224</td><td>Cantate / Koraal</td></tr>
+          <tr><td style="padding:5px 10px;">225 – 231</td><td>Motet</td></tr>
+          <tr><td style="padding:5px 10px;">232 – 236</td><td>Mis</td></tr>
+          <tr><td style="padding:5px 10px;">244 / 245</td><td>Matthäus / Johannes Passion</td></tr>
+          <tr><td style="padding:5px 10px;">248</td><td>Kerstoratorium</td></tr>
+          <tr style="color:var(--accent);"><td style="padding:5px 10px;">250 – 438</td><td><strong>Koralen ← meest gebruikt</strong></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div>
+      <p class="small" style="margin-bottom:.5em;">Wat wordt opgeslagen?</p>
+      <div class="card" style="margin-bottom:10px;">
+        <h3>MIDI (.mid)</h3>
+        <p>Noten, ritme, stemindeling, tempo — basis voor training en afspelen.</p>
+      </div>
+      <div class="card">
+        <h3>MusicXML (.xml)</h3>
+        <p>Sleutels, maatsoorten, dynamiek — gebruikt voor bladmuziekweergave via abcjs.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 5 — Tokenisatie
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Tokenisatie</h2>
+  <p>Elke noot of rust wordt een <strong>VoiceToken</strong>: een paar <code>(MIDI-pitch, duur)</code></p>
+
+  <div style="margin: 1.2em 0;">
+    <p class="small">Voorbeeld: BWV 227 · Soprano-stem</p>
+    <div style="line-height:2.5;">
+      <span class="token-box">(72, 1.0)</span>
+      <span class="token-box arrow">→</span>
+      <span class="token-box">(74, 0.5)</span>
+      <span class="token-box arrow">→</span>
+      <span class="token-box">(76, 0.5)</span>
+      <span class="token-box arrow">→</span>
+      <span class="token-box rest">(0, 1.0)</span>
+      <span class="token-box arrow">→</span>
+      <span class="token-box">(71, 2.0)</span>
+      <span class="token-box arrow">→</span>
+      <span style="color:#475569; font-size:.85em;">…</span>
+    </div>
+    <p class="small" style="margin-top:.5em;">pitch 0 = rust &nbsp;·&nbsp; duur in kwartnootheden</p>
+  </div>
+
+  <div class="two-col" style="margin-top:1em;">
+    <div class="card">
+      <h3>Duratierooster</h3>
+      <p style="font-family:monospace; color:var(--accent); font-size:.9em;">
+        0.25 · 0.5 · 0.75 · 1.0<br>1.5 · 2.0 · 3.0 · 4.0
+      </p>
+      <p>Micro-timings worden afgerond naar de dichtstbijzijnde waarde.</p>
+    </div>
+    <div class="card">
+      <h3>Vocabulaire</h3>
+      <p>Alle unieke tokens in het trainingskorpus worden genummerd: <br>
+        <code style="color:var(--accent);">(pitch, duur) → integer</code><br>
+        Bewaard als <code>.pkl</code> naast het model.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 6 — LSTM-architectuur
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>LSTM-architectuur</h2>
+  <div class="two-col-6040">
+    <div>
+      <p>Het model leert: <em>gegeven de laatste N tokens, wat komt er hierna?</em></p>
+      <pre><code class="python" data-trim>
+class LSTMModel(nn.Module):
+    def __init__(self, vocab, embed_dim=64,
+                 hidden=256, lagen=2, dropout=0.3):
+        self.embedding = nn.Embedding(vocab, embed_dim)
+        self.lstm      = nn.LSTM(embed_dim, hidden,
+                                 num_layers=lagen, ...)
+        self.dropout   = nn.Dropout(dropout)
+        self.fc        = nn.Linear(hidden, vocab)
+
+    def forward(self, x):
+        x = self.embedding(x)          # tokens → vectors
+        out, _ = self.lstm(x)          # contextuele verwerking
+        return self.fc(self.dropout(   # logits per token
+            out[:, -1, :]))
+      </code></pre>
+    </div>
+    <div class="arch">
+      <div class="arch-block ab-embed">Embedding<br><span style="font-size:.75em;font-weight:400;">vocab → 64</span></div>
+      <div class="arch-arrow">↓</div>
+      <div class="arch-block ab-lstm">LSTM × 2 lagen<br><span style="font-size:.75em;font-weight:400;">64 → 256 hidden</span></div>
+      <div class="arch-arrow">↓</div>
+      <div class="arch-block ab-drop">Dropout (0.3)</div>
+      <div class="arch-arrow">↓</div>
+      <div class="arch-block ab-fc">Linear<br><span style="font-size:.75em;font-weight:400;">256 → vocab</span></div>
+      <div class="arch-arrow">↓</div>
+      <div class="arch-block ab-out">Logits (kansen)</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 7 — Training
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Training</h2>
+  <div class="two-col">
+    <div>
+      <p class="small">Sliding-window sequenties (venster = 16)</p>
+      <pre><code class="python" data-trim>
+# tokens: [t0, t1, t2, ... t20]
+# venster: 16 → oplevert:
+X[0] = [t0 … t15],  y[0] = t16
+X[1] = [t1 … t16],  y[1] = t17
+# ...
+      </code></pre>
+      <div style="margin-top:1em;">
+        <p class="small">Configureerbare hyperparameters</p>
+        <table style="font-size:.78em; width:100%; border-collapse:collapse;">
+          <tr style="color:#64748b;"><td style="padding:4px 8px;">Venster</td><td>context-lengte (standaard 16)</td></tr>
+          <tr style="color:#cbd5e1;"><td style="padding:4px 8px;">Hidden</td><td>64 – 512 units per LSTM-laag</td></tr>
+          <tr style="color:#64748b;"><td style="padding:4px 8px;">Lagen</td><td>1 – 4 gestapelde LSTM-lagen</td></tr>
+          <tr style="color:#cbd5e1;"><td style="padding:4px 8px;">Epochs</td><td>max 5 – 200 (early stopping)</td></tr>
+          <tr style="color:#64748b;"><td style="padding:4px 8px;">Geduld</td><td>stop na N epochs zonder verbetering</td></tr>
+        </table>
+      </div>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:10px;">
+        <h3>🔄 Early stopping</h3>
+        <p>Bewaard het model met het laagste <em>validatie</em>verlies — niet het laatste epoch.</p>
+      </div>
+      <div class="card" style="margin-bottom:10px;">
+        <h3>⚡ GPU-ondersteuning</h3>
+        <p>Automatische detectie: Intel Arc (XPU) → NVIDIA (CUDA) → CPU.</p>
+      </div>
+      <div class="card">
+        <h3>✂️ Gradient clipping</h3>
+        <p>Max norm 1.0 voorkomt exploderende gradiënten bij lange sequenties.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 8 — Generatiemodus A: Aanvulling
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Modus A — Aanvulling</h2>
+  <p>Eerste helft als seed · origineel ritme behouden · toonaard-filter actief</p>
+
+  <div style="margin: 1em 0;">
+    <p class="small">Splitsbalk (blauw = origineel · geel = AI)</p>
+    <div class="mode-bar">
+      <div class="orig" style="flex:1;"></div>
+      <div class="ai"   style="flex:1;"></div>
+    </div>
+    <div style="display:flex; font-size:.7em; color:#94a3b8;">
+      <div style="flex:1;">🔵 Maat 1 – N/2 · origineel</div>
+      <div style="flex:1; text-align:right;">🟡 Maat N/2+1 – N · AI gegenereerd</div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:1em;">
+    <div>
+      <p class="small" style="color:var(--accent); font-weight:700;">FASE 1 — Ritme overnemen</p>
+      <p style="font-size:.85em;">Het originele ritme van de tweede helft wordt exact gekopieerd. Alleen de <em>pitches</em> worden vervangen.</p>
+    </div>
+    <div>
+      <p class="small" style="color:var(--accent2); font-weight:700;">FASE 2 — Melodie genereren</p>
+      <p style="font-size:.85em;">
+        Per duurslot kiest het model een pitch.<br>
+        Toonaard-filter (Krumhansl-Schmuckler): alleen noten uit de gedetecteerde toonaard zijn toegestaan.
+      </p>
+    </div>
+  </div>
+
+  <div class="highlight-box" style="margin-top:1em;">
+    <p>
+      <code style="color:var(--accent);">P(pitch | context, duur)</code> &nbsp;—&nbsp;
+      het model samples uit tokens met de juiste duur, gefilterd op pitchklassen 0–11 van de toonaard.
+    </p>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 9 — Generatiemodus B: Bach-stijl
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Modus B — Bach-stijl</h2>
+  <p>Eerste 4 maten als seed · model genereert ritme én melodie volledig vrij</p>
+
+  <div style="margin: 1em 0;">
+    <div class="mode-bar">
+      <div class="orig" style="flex:.15;"></div>
+      <div class="ai"   style="flex:.85;"></div>
+    </div>
+    <div style="display:flex; font-size:.7em; color:#94a3b8;">
+      <div style="flex:.15;">🔵 4 maten</div>
+      <div style="flex:.85; text-align:right;">🟡 rest volledig AI</div>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:1em;">
+    <div>
+      <p class="small" style="color:var(--accent); font-weight:700;">FASE 1 — Ritme genereren</p>
+      <pre><code class="python" data-trim>
+# Marginaliseer over pitches:
+P(duur | context) =
+    Σ_pitch P(pitch, duur | context)
+
+# → duur-gewichten via softmax
+# → sample één duur via multinomial
+      </code></pre>
+    </div>
+    <div>
+      <p class="small" style="color:var(--accent2); font-weight:700;">FASE 2 — Melodie genereren</p>
+      <div class="card">
+        <h3>Geen toonaard-filter</h3>
+        <p>Het model bepaalt zelf de toonaard op basis van de geleerde Bach-stijl. Meer creatieve vrijheid.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 10 — Sampling: temperatuur & top-k
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Sampling-parameters</h2>
+  <div class="two-col">
+    <div>
+      <h3 style="color:var(--accent); font-size:1em; margin-bottom:.5em;">🌡️ Temperatuur</h3>
+      <pre><code class="python" data-trim>
+probs = softmax(logits / T)
+# T = 0.3 → scherpe verdeling
+#           (Bach-achtig, voorspelbaar)
+# T = 1.5 → vlakke verdeling
+#           (creatief, willekeurig)
+      </code></pre>
+      <div style="display:flex; gap:8px; margin-top:.75em; font-size:.75em;">
+        <span class="chip chip-blue">0.3 → Bach-achtig</span>
+        <span class="chip chip-amber">1.5 → experiment</span>
+      </div>
+    </div>
+    <div>
+      <h3 style="color:var(--accent3); font-size:1em; margin-bottom:.5em;">🎯 Top-k filtering</h3>
+      <pre><code class="python" data-trim>
+# Maskeer alles buiten de top-k
+grens = topk(logits, k).values[-1]
+logits[logits < grens] = -inf
+# → dan softmax over k kandidaten
+# k=0: alle tokens
+# k=10: alleen 10 beste
+      </code></pre>
+      <div style="font-size:.8em; color:#94a3b8; margin-top:.75em;">
+        Hogere k = meer variatie in de melodie.
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 11 — MIDI-uitvoer
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Van tokens naar geluid</h2>
+  <p class="small">De gegenereerde tokens worden omgezet naar een afspeelbaar MIDI-bestand</p>
+
+  <div class="card-row" style="margin-top:1em;">
+    <div class="card">
+      <div class="icon">🔨</div>
+      <h3>music21 bouwen</h3>
+      <p>Elke AI-stem wordt als aparte <code>Part</code> ingevoegd, startend op de splitsmaat.</p>
+    </div>
+    <div class="card">
+      <div class="icon">💾</div>
+      <h3>In RAM schrijven</h3>
+      <p><code>mf.writestr()</code> schrijft de MIDI naar bytes in geheugen. Geen schijfbestand.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🌐</div>
+      <h3>data-URI in HTML</h3>
+      <p>Base64-encoded bytes als <code>data:audio/midi;base64,…</code> direct in de HTML pagina.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🎹</div>
+      <h3>Browser afspeelt</h3>
+      <p><code>html-midi-player</code> + Magenta.js: piano-roll visualisatie + geluid. Download ingebouwd.</p>
+    </div>
+  </div>
+
+  <div class="highlight-box" style="margin-top:1em;">
+    <p>
+      Geen enkel serververzoek na het laden van de pagina —
+      alles draait client-side in de browser.
+    </p>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 12 — Streamlit-app
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>De Streamlit-app</h2>
+  <div class="card-row">
+    <div class="card">
+      <div class="icon">🏠</div>
+      <h3>app.py — Overzicht</h3>
+      <p>Filterbare tabel met alle werken. Per werk: bladmuziek (abcjs) en piano-roll. Stemkeuze via multiselect.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🎓</div>
+      <h3>Training.py</h3>
+      <p>Model trainen met live voortgang, verliesplot en modelbeheer. GPU auto-detectie.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🎵</div>
+      <h3>Genereer.py</h3>
+      <p>Aanvulling of Bach-stijl genereren. Twee piano-rolls naast elkaar met maat-enteller.</p>
+    </div>
+  </div>
+
+  <div class="two-col" style="margin-top:1.2em; font-size:.85em;">
+    <div>
+      <p class="small" style="margin-bottom:.4em;">Maat-enteller (JavaScript, elke 100ms)</p>
+      <div style="background:var(--mid); border-radius:8px; padding:10px 14px; border:1px solid #334155;">
+        <span style="color:var(--accent); font-family:monospace; font-weight:700;">Maat 12 / 24</span>
+        <span style="color:#64748b; font-size:.85em; margin-left:8px;">(origineel)</span>
+      </div>
+      <div style="background:var(--mid); border-radius:8px; padding:10px 14px; border:1px solid #334155; margin-top:6px;">
+        <span style="color:var(--accent2); font-family:monospace; font-weight:700;">Maat 14 / 24</span>
+        <span style="color:#64748b; font-size:.85em; margin-left:8px;">(AI)</span>
+      </div>
+    </div>
+    <div>
+      <p class="small" style="margin-bottom:.4em;">Splitsbalk</p>
+      <div class="mode-bar" style="height:24px;">
+        <div class="orig" style="flex:1;"></div>
+        <div class="ai"   style="flex:1;"></div>
+      </div>
+      <p style="font-size:.75em; color:#94a3b8; margin-top:.4em;">
+        Toont visueel welk deel origineel is en welk deel door de AI gegenereerd werd.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 13 — Tech-stack
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Tech-stack</h2>
+  <div class="tech-grid">
+    <div class="tech-item">
+      <div class="logo">🔥</div>
+      <div class="name">PyTorch</div>
+      <div class="role">LSTM-model & training</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🎵</div>
+      <div class="name">music21</div>
+      <div class="role">MIDI/XML parsing & export</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🌊</div>
+      <div class="name">Streamlit</div>
+      <div class="role">Interactieve UI</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🐼</div>
+      <div class="name">pandas</div>
+      <div class="role">Data & CSV-beheer</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🎹</div>
+      <div class="name">html-midi-player</div>
+      <div class="role">Piano-roll in browser</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🎼</div>
+      <div class="name">abcjs</div>
+      <div class="role">Bladmuziek → SVG</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">🧮</div>
+      <div class="name">NumPy</div>
+      <div class="role">Sequentie-verwerking</div>
+    </div>
+    <div class="tech-item">
+      <div class="logo">⚡</div>
+      <div class="name">Intel IPEX</div>
+      <div class="role">Arc GPU-optimalisatie</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 14 — Samenvatting
+═══════════════════════════════════════════════════════════════ -->
+<section data-background-color="#0f172a">
+  <h2>Wat hebben we gebouwd?</h2>
+  <div class="card-row">
+    <div class="card">
+      <div class="icon">📥</div>
+      <h3>Volledige datapipeline</h3>
+      <p>400+ Bach-werken automatisch gedownload, geanalyseerd en geclassificeerd.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🧠</div>
+      <h3>Configureerbaar LSTM</h3>
+      <p>Trainbaar op elk muziekgenre, met GPU-ondersteuning en early stopping.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🎼</div>
+      <h3>Twee generatiemodi</h3>
+      <p>Aanvulling met toonaard-filter of vrije Bach-stijl generatie per stem.</p>
+    </div>
+    <div class="card">
+      <div class="icon">🌐</div>
+      <h3>Interactieve app</h3>
+      <p>Bladmuziek, piano-roll, maat-enteller en live download — alles in de browser.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════════════
+     SLIDE 15 — Einde / Demo
+═══════════════════════════════════════════════════════════════ -->
+<section class="end-slide" data-background-gradient="radial-gradient(ellipse at 40% 60%, #0c1a3a 0%, #0f172a 70%)">
+  <div style="font-size:3.5em; margin-bottom:.3em;">🎵</div>
+  <h1>Live demo</h1>
+  <p style="color:#94a3b8; font-size:1em; margin-top:.5em;">
+    Streamlit openen en zelf genereren
+  </p>
+  <div class="cmd-box">
+    streamlit run app.py
+  </div>
+  <div class="badge-row" style="margin-top:2.5em;">
+    <span class="badge badge-blue">github.com/kurtmaekelberghe</span>
+  </div>
+</section>
+
+</div><!-- /slides -->
+</div><!-- /reveal -->
+
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/dist/reveal.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/highlight/highlight.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/reveal.js@5.1.0/plugin/notes/notes.js"></script>
+<script>
+Reveal.initialize({
+  hash: true,
+  transition: 'slide',
+  transitionSpeed: 'fast',
+  backgroundTransition: 'fade',
+  plugins: [ RevealHighlight, RevealNotes ],
+  highlight: { highlightOnLoad: true },
+  width: 1100,
+  height: 700,
+  margin: 0.06,
+  controls: true,
+  progress: true,
+  slideNumber: 'c/t',
+  navigationMode: 'linear',
+});
+</script>
+</body>
+</html>
