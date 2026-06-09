@@ -14,6 +14,7 @@ from music21 import chord
 import numpy as np
 from scipy.spatial.distance import cdist
 
+# Method 1: Note sequence similarity using difflib (it measures how closely the two MIDI files match in terms of which notes are played and when, by treating them as sequences and comparing them like text.)
 def extract_notes(midi_path):
     """
     Extracts a list of (note, time) tuples from a MIDI file.
@@ -197,10 +198,7 @@ if __name__ == "__main__":
     base_folder = "C:\\Users\\ghekiereb\\data\\MuziekVoorspellen\\data\\raw\\bach"
     file_a = base_folder + "\\bwv2.6.mid"
     file_b = base_folder + "\\bwv1.6.mid"
-    similarity = midi_similarity(file_a, file_b)
-    print(f"Similarity: {similarity}%")
-
-    # Example
+    print(f"1. MIDI Similarity: {midi_similarity(file_a, file_b)}%")
     print(f"2. Pitch similarity: {pitch_similarity(file_a, file_b)}%")
     print(f"3. Pitch + rhythm similarity: {similarity_pitch_rhythm(file_a, file_b)}%")
     print(f"4. Histogram similarity: {similarity_histogram(file_a, file_b)}%")

@@ -1,3 +1,50 @@
+Functions to compare to midi files
+
+
+
+Available under 
+
+
+
+1. MIDI similarity : midi\_similarity(file\_a, file\_b)
+
+2\. Pitch similarity : pitch\_similarity(file\_a, file\_b)
+
+3\. Pitch + rhythm similarity : similarity\_pitch\_rhythm(file\_a, file\_b)
+
+4\. Histogram similarity : similarity\_histogram(file\_a, file\_b)
+
+5\. Chord similarity : similarity\_chords(file\_a, file\_b)
+
+6\. DTW similarity : dtw\_similarity(file\_a, file\_b)
+
+
+
+Combined similarity : combined\_similarity(file\_a, file\_b)
+
+
+
+Brief explanation
+
+1. midi\_similarity(file1, file2) computes how similar two MIDI files are by comparing their note sequences.
+In brief:
+
+&#x20;  1. Extract notes:It calls extract\_notes on both files to get lists of (note, time) pairs (note pitch + when it occurs).
+
+&#x20;  2. Convert to sequences: Each list is turned into a string like "60-0 64-480 67-960" so the order and timing are encoded.
+
+&#x20;  3. Compare sequences: It uses SequenceMatcher (a text comparison tool) to measure how similar the two strings are.
+
+&#x20;  4. Return result: the similarity score is returned as a percentage (0–100%).
+
+
+
+👉 Overall: it measures how closely the two MIDI files match in terms of which notes are played and when, by treating them as sequences and comparing them like text.
+
+
+
+
+
 2\. 🎵 Pitch similarity — 22.4%
 
 
