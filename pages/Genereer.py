@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import base64
+import copy
 import glob
 import importlib.metadata
 import os
 import pickle
+import random
 import re
+import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +21,7 @@ import torch.nn as nn
 
 # ── Paden ─────────────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "scripts"))
 DATA_DIR     = PROJECT_ROOT / "data"
 ANALYSE_CSV  = DATA_DIR / "processed" / "bach_analyse.csv"
 METADATA_CSV = DATA_DIR / "processed" / "bach_metadata.csv"
@@ -681,6 +686,319 @@ def _genereer_melodie(
     return resultaat
 
 
+# ── Vergelijkingsfuncties (ingebouwd, zonder externe afhankelijkheden) ────────
+
+def _levenshtein(a: list, b: list) -> float:
+    """Levenshtein-afstand tussen twee lijsten."""
+    la, lb = len(a), len(b)
+    # Begrens lengte voor performance bij lange stukken
+    a, b = a[:300], b[:300]
+    la, lb = len(a), len(b)
+    dp = np.zeros((la + 1, lb + 1))
+    for i in range(la + 1):
+        dp[i][0] = i
+    for j in range(lb + 1):
+        dp[0][j] = j
+    for i in range(1, la + 1):
+        for j in range(1, lb + 1):
+            cost = 0 if a[i - 1] == b[j - 1] else 1
+            dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
+    return dp[-1][-1]
+
+
+def _extract_pitches(midi_pad: str) -> list[int]:
+    from music21 import converter, note as m21_note
+    score = converter.parse(midi_pad)
+    return [n.pitch.midi for n in score.recurse().notes if isinstance(n, m21_note.Note)]
+
+
+def _vergelijk_toonhoogte(f1: str, f2: str) -> float:
+    """Melodische gelijkenis op basis van MIDI-nootnummers (Levenshtein)."""
+    p1, p2 = _extract_pitches(f1), _extract_pitches(f2)
+    if not p1 or not p2:
+        return 0.0
+    return round(max(0.0, (1 - _levenshtein(p1, p2) / max(len(p1), len(p2))) * 100), 1)
+
+
+def _vergelijk_ritme_toon(f1: str, f2: str) -> float:
+    """Gelijkenis op (noot, duur)-paren (Levenshtein)."""
+    from music21 import converter, note as m21_note
+    def extract(path: str) -> list:
+        score = converter.parse(path)
+        return [(n.pitch.midi, round(float(n.duration.quarterLength), 2))
+                for n in score.recurse().notes if isinstance(n, m21_note.Note)]
+    s1, s2 = extract(f1), extract(f2)
+    if not s1 or not s2:
+        return 0.0
+    return round(max(0.0, (1 - _levenshtein(s1, s2) / max(len(s1), len(s2))) * 100), 1)
+
+
+def _vergelijk_histogram(f1: str, f2: str) -> float:
+    """Toonsoortconsistentie via cosinusgelijkenis van de nootverdeling (0–128)."""
+    def hist(path: str) -> np.ndarray:
+        pitches = _extract_pitches(path)
+        v = np.zeros(128)
+        for p in pitches:
+            v[p] += 1
+        s = v.sum()
+        return v / s if s > 0 else v
+    h1, h2 = hist(f1), hist(f2)
+    denom = np.linalg.norm(h1) * np.linalg.norm(h2)
+    return round(float(np.dot(h1, h2) / denom * 100) if denom > 0 else 0.0, 1)
+
+
+def _vergelijk_akkoorden(f1: str, f2: str) -> float:
+    """Harmonische gelijkenis via akkoordreeksen (Levenshtein)."""
+    from music21 import converter, chord as m21_chord
+    def extract(path: str) -> list:
+        score = converter.parse(path)
+        return [tuple(sorted(p.midi for p in c.pitches))
+                for c in score.chordify().recurse() if isinstance(c, m21_chord.Chord)]
+    c1, c2 = extract(f1), extract(f2)
+    if not c1 or not c2:
+        return 0.0
+    return round(max(0.0, (1 - _levenshtein(c1, c2) / max(len(c1), len(c2))) * 100), 1)
+
+
+# ── Willekeurige generatie ────────────────────────────────────────────────────
+
+def _genereer_willekeurig_b64(
+    midi_pad: str,
+    helft_maten: int,
+    n_stemmen: int,
+    ritmes: list[list[float]],
+    inv_vocab: dict[int, VoiceToken],
+    duur_naar_codes: dict[float, list[int]],
+) -> str:
+    """Genereer tweede helft volledig willekeurig: uniforme sampling uit het vocabulaire."""
+    ai_stemmen: list[list[VoiceToken]] = []
+    for stem_i in range(n_stemmen):
+        tokens: list[VoiceToken] = []
+        for duur in ritmes[stem_i]:
+            kandidaten = duur_naar_codes.get(duur)
+            if kandidaten:
+                tokens.append(inv_vocab[random.choice(kandidaten)])
+            else:
+                tokens.append((0, duur))
+        ai_stemmen.append(tokens)
+    return _eerste_helft_plus_ai_b64(midi_pad, helft_maten, ai_stemmen)
+
+
+# ── Fine-tuning + generatie ───────────────────────────────────────────────────
+
+def _finetunen_en_genereer_b64(
+    model: LSTMModel,
+    vocab: dict[VoiceToken, int],
+    per_maat: list,
+    helft_maten: int,
+    n_stemmen: int,
+    ritmes: list[list[float]],
+    duur_naar_codes: dict[float, list[int]],
+    inv_vocab: dict[int, VoiceToken],
+    midi_pad: str,
+    venster: int,
+    temperatuur: float,
+    top_k: int,
+    toegestane_pitchklassen: set[int] | None,
+    finetune_epochs: int = 8,
+) -> str:
+    """Fine-tune het model op de eerste helft, genereer daarna de tweede helft.
+
+    Maakt een diepe kopie van het model zodat de originele gewichten bewaard blijven.
+    Past Adam-gradient-updates toe op de eerste-helft-tokens (sliding window),
+    en genereert vervolgens de tweede helft met het aangepaste model.
+    """
+    ft_model = copy.deepcopy(model)
+    ft_model.train()
+    optimizer = torch.optim.Adam(ft_model.parameters(), lr=2e-3)
+    criterion = nn.CrossEntropyLoss()
+
+    for _ in range(finetune_epochs):
+        for stem_i in range(n_stemmen):
+            eerste = [
+                t for maat in per_maat[:helft_maten]
+                for t in (maat[stem_i] if stem_i < len(maat) else [])
+            ]
+            codes = [vocab[t] for t in eerste if t in vocab]
+            if len(codes) <= venster:
+                continue
+            for start in range(len(codes) - venster):
+                inp = torch.tensor([codes[start:start + venster]], dtype=torch.long)
+                tgt = torch.tensor(codes[start + venster], dtype=torch.long)
+                optimizer.zero_grad()
+                loss = criterion(ft_model(inp)[0], tgt)
+                loss.backward()
+                optimizer.step()
+
+    ft_model.eval()
+
+    stem_seeds = []
+    for stem_i in range(n_stemmen):
+        eerste = [
+            t for maat in per_maat[:helft_maten]
+            for t in (maat[stem_i] if stem_i < len(maat) else [])
+        ]
+        stem_seeds.append([vocab[t] for t in eerste if t in vocab])
+
+    ai_stemmen: list[list[VoiceToken]] = []
+    for stem_i in range(n_stemmen):
+        seeds = stem_seeds[stem_i]
+        if len(seeds) < venster or not ritmes[stem_i]:
+            ai_stemmen.append([])
+            continue
+        melodie = _genereer_melodie(
+            ft_model, seeds, ritmes[stem_i],
+            duur_naar_codes, inv_vocab,
+            venster, temperatuur, top_k,
+            toegestane_pitchklassen=toegestane_pitchklassen,
+        )
+        ai_stemmen.append(melodie)
+
+    return _eerste_helft_plus_ai_b64(midi_pad, helft_maten, ai_stemmen)
+
+
+# ── Vergelijking met origineel ────────────────────────────────────────────────
+
+def _bereken_vergelijking(
+    orig_pad: str,
+    versies: dict[str, str],   # naam → base64-MIDI
+) -> dict[str, dict[str, float]]:
+    """Vergelijk elke gegenereerde versie met het origineel.
+
+    Schrijft elke versie tijdelijk naar disk, voert de 4 vergelijkingsfuncties
+    uit en verwijdert het tijdelijke bestand daarna.
+    """
+    resultaten: dict[str, dict[str, float]] = {}
+    for naam, b64 in versies.items():
+        tmp = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+        try:
+            tmp.write(base64.b64decode(b64))
+            tmp.close()
+            resultaten[naam] = {
+                "Toonhoogte": _vergelijk_toonhoogte(orig_pad, tmp.name),
+                "Ritme+toon": _vergelijk_ritme_toon(orig_pad, tmp.name),
+                "Histogram":  _vergelijk_histogram(orig_pad, tmp.name),
+                "Akkoorden":  _vergelijk_akkoorden(orig_pad, tmp.name),
+            }
+        except Exception as e:
+            resultaten[naam] = {"Toonhoogte": 0.0, "Ritme+toon": 0.0,
+                                 "Histogram": 0.0, "Akkoorden": 0.0}
+        finally:
+            os.unlink(tmp.name)
+    return resultaten
+
+
+_KLEUREN_VERSIES = {
+    "AI-aanvulling": "#38bdf8",
+    "Fine-tuned":    "#34d399",
+    "Willekeurig":   "#f87171",
+}
+_CATEGORIEEN = ["Toonhoogte", "Ritme+toon", "Histogram", "Akkoorden"]
+
+
+def _toon_vergelijking(vergelijking: dict[str, dict[str, float]]) -> None:
+    """Toon vergelijkingsscores als radardiagram + staafdiagram + tabel."""
+    if not vergelijking:
+        st.warning("Geen vergelijkingsdata beschikbaar.")
+        return
+
+    try:
+        import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
+    except ImportError:
+        st.warning("Plotly niet geïnstalleerd — `pip install plotly`")
+        _toon_vergelijking_tabel(vergelijking)
+        return
+
+    # ── Radardiagram ──────────────────────────────────────────────────────────
+    radar = go.Figure()
+    for naam, scores in vergelijking.items():
+        waarden = [scores.get(c, 0) for c in _CATEGORIEEN]
+        radar.add_trace(go.Scatterpolar(
+            r=waarden + [waarden[0]],
+            theta=_CATEGORIEEN + [_CATEGORIEEN[0]],
+            fill="toself",
+            name=naam,
+            line_color=_KLEUREN_VERSIES.get(naam, "#94a3b8"),
+            opacity=0.75,
+        ))
+    radar.update_layout(
+        polar=dict(radialaxis=dict(visible=True, range=[0, 100],
+                                   tickfont=dict(size=10))),
+        showlegend=True,
+        height=360,
+        margin=dict(l=40, r=40, t=30, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", y=-0.05),
+    )
+
+    # ── Staafdiagram (groepering per categorie) ───────────────────────────────
+    balk = go.Figure()
+    for naam, scores in vergelijking.items():
+        balk.add_trace(go.Bar(
+            name=naam,
+            x=_CATEGORIEEN,
+            y=[scores.get(c, 0) for c in _CATEGORIEEN],
+            marker_color=_KLEUREN_VERSIES.get(naam, "#94a3b8"),
+            text=[f"{scores.get(c,0):.0f}%" for c in _CATEGORIEEN],
+            textposition="outside",
+        ))
+    balk.update_layout(
+        barmode="group",
+        yaxis=dict(range=[0, 110], title="Score (%)"),
+        xaxis=dict(title=""),
+        height=360,
+        margin=dict(l=20, r=20, t=20, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        showlegend=False,
+    )
+
+    col_r, col_b = st.columns(2)
+    with col_r:
+        st.caption("Radardiagram — gelijkenis per dimensie")
+        st.plotly_chart(radar, use_container_width=True)
+    with col_b:
+        st.caption("Staafdiagram — vergelijking per categorie")
+        st.plotly_chart(balk, use_container_width=True)
+
+    # ── Uitleg per metric ─────────────────────────────────────────────────────
+    with st.expander("ℹ️ Uitleg van de metrics"):
+        st.markdown("""
+**Toonhoogte** — *Melodische gelijkenis*
+Vergelijkt de reeks van MIDI-nootnummers (0–127) van het gegenereerde stuk met het origineel via de Levenshtein-afstand. Een hoge score betekent dat het model dezelfde noten speelt als Bach, in een vergelijkbare volgorde. Een lage score wijst op melodische afwijking.
+
+---
+
+**Ritme+toon** — *Melodie én ritme samen*
+Elk element is een (noot, duur)-paar, zodat ook het ritme meeweegt. Twee stukken kunnen dezelfde noten hebben maar een ander ritme — dan scoort Toonhoogte hoog maar Ritme+toon lager. Dit is de strengste maat voor naleving van het origineel.
+
+---
+
+**Histogram** — *Toonsoortconsistentie*
+Vergelijkt de verdeling van nootnummers als vector via cosinusgelijkenis. Het maakt niet uit in welke volgorde noten voorkomen, alleen hoe vaak. Een hoge score betekent dat het gegenereerde stuk dezelfde toonsoort en nootvoorkeur heeft als het origineel — het "klinkt in dezelfde toonaard".
+
+---
+
+**Akkoorden** — *Harmonische gelijkenis*
+Vergelijkt de reeks van akkoorden (gelijktijdige noten) via Levenshtein. Bach heeft typische akkoordprogressies (I–IV–V–I). Een hoge score wijst erop dat het model vergelijkbare harmonieën gebruikt.
+""")
+
+    # ── Samenvattingstabel ────────────────────────────────────────────────────
+    _toon_vergelijking_tabel(vergelijking)
+
+
+def _toon_vergelijking_tabel(vergelijking: dict[str, dict[str, float]]) -> None:
+    rijen = []
+    for naam, scores in vergelijking.items():
+        gem = round(sum(scores.values()) / len(scores), 1)
+        rijen.append({"Versie": naam, **scores, "Gemiddeld ★": gem})
+    df_verg = pd.DataFrame(rijen).set_index("Versie")
+    st.dataframe(
+        df_verg.style.background_gradient(cmap="Blues", vmin=0, vmax=100),
+        use_container_width=True,
+    )
+
+
 # ── Piano-roll HTML ───────────────────────────────────────────────────────────
 
 def _piano_roll_html(
@@ -1089,11 +1407,25 @@ def _voer_generatie_uit(
             )
             ai_stemmen.append(melodie)
 
-        st.write("MIDI bouwen — elke stem als aparte part…")
+        st.write("MIDI bouwen — AI-aanvulling…")
         with open(midi_pad, "rb") as f:
             origineel_b64 = base64.b64encode(f.read()).decode()
 
         ai_b64 = _eerste_helft_plus_ai_b64(midi_pad, helft_maten, ai_stemmen)
+
+        st.write("MIDI bouwen — Fine-tuned versie (model leert op eerste helft)…")
+        ft_b64 = _finetunen_en_genereer_b64(
+            model, vocab, per_maat, helft_maten, n_stemmen,
+            ritmes, duur_naar_codes, inv_vocab, midi_pad,
+            venster, temperatuur, top_k,
+            toegestane_pitchklassen=toegestane_pitchklassen,
+        )
+
+        st.write("MIDI bouwen — Willekeurige versie (geen leren)…")
+        rand_b64 = _genereer_willekeurig_b64(
+            midi_pad, helft_maten, n_stemmen,
+            ritmes, inv_vocab, duur_naar_codes,
+        )
 
         # Maatstarttijden in seconden berekenen voor de JavaScript maatenteller
         bpm = _tempo_uit_midi(midi_pad)
@@ -1106,6 +1438,13 @@ def _voer_generatie_uit(
                 for _, duur in maat[0]:
                     cumulatief += duur
 
+        st.write("Vergelijking berekenen…")
+        vergelijking = _bereken_vergelijking(midi_pad, {
+            "AI-aanvulling": ai_b64,
+            "Fine-tuned":    ft_b64,
+            "Willekeurig":   rand_b64,
+        })
+
         totaal_nieuwe  = sum(len(s) for s in ai_stemmen)
         totaal_orig_2e = sum(
             len(maat[si] if si < len(maat) else [])
@@ -1117,6 +1456,9 @@ def _voer_generatie_uit(
         st.session_state.update({
             "gen_origineel_b64":   origineel_b64,
             "gen_ai_b64":          ai_b64,
+            "gen_ft_b64":          ft_b64,
+            "gen_rand_b64":        rand_b64,
+            "gen_vergelijking":    vergelijking,
             "gen_song":            song_naam,
             "gen_helft_maten":     helft_maten,
             "gen_totaal_maten":    len(per_maat),
@@ -1132,29 +1474,22 @@ def _voer_generatie_uit(
 
 
 def _toon_resultaat() -> None:
-    """Toon het resultaat van de aanvullingsmodus.
-
-    Leest de gegenereerde MIDI en metadata uit st.session_state en toont:
-      - Vier metrics: totaal maten, eerste/tweede helft bereik, token-count
-      - Een visuele splitsbalk (blauw = origineel, geel = AI)
-      - Twee piano-rolls naast elkaar: origineel vs. AI-aanvulling
-    """
+    """Toon het resultaat van de aanvullingsmodus: 4 versies + vergelijking."""
     st.divider()
 
-    hm   = st.session_state["gen_helft_maten"]
-    tm   = st.session_state["gen_totaal_maten"]
-    st_  = st.session_state["gen_seed_tokens"]
-    nt   = st.session_state["gen_nieuwe_tokens"]
-    ot   = st.session_state["gen_orig_2e_tokens"]
+    hm  = st.session_state["gen_helft_maten"]
+    tm  = st.session_state["gen_totaal_maten"]
+    nt  = st.session_state["gen_nieuwe_tokens"]
+    ot  = st.session_state["gen_orig_2e_tokens"]
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Totaal maten",             tm)
-    c2.metric("Eerste helft (origineel)", f"maat 1 – {hm}")
-    c3.metric("Tweede helft (AI)",        f"maat {hm + 1} – {tm}")
+    c2.metric("Eerste helft (origineel)", f"maat 1–{hm}")
+    c3.metric("Tweede helft (AI)",        f"maat {hm+1}–{tm}")
     c4.metric("Tokens gegenereerd",       f"{nt}  (orig: {ot})")
 
-    # Visuele splitsbalk: blauw = origineel, geel = AI
+    # Visuele splitsbalk
     frac = hm / tm
     st.markdown(
         f"""
@@ -1164,43 +1499,74 @@ def _toon_resultaat() -> None:
         </div>
         <div style="display:flex;font-size:12px;color:#94a3b8;margin-bottom:10px">
           <div style="flex:{frac}">🔵 Origineel (maat 1–{hm})</div>
-          <div style="flex:{1-frac};text-align:right">🟡 AI (maat {hm+1}–{tm})</div>
+          <div style="flex:{1-frac};text-align:right">🟡 Gegenereerd (maat {hm+1}–{tm})</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-    # ── Piano rolls naast elkaar ──────────────────────────────────────────────
-    col1, col2 = st.columns(2)
     maat_starts = st.session_state.get("gen_maat_starts_s", [])
 
+    # ── Rij 1: Origineel + AI-aanvulling ─────────────────────────────────────
+    col1, col2 = st.columns(2)
     with col1:
         st.subheader("🎼 Origineel")
-        st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · origineel")
+        st.caption(f"Maten 1–{tm} · volledig origineel")
         st.components.v1.html(
             _piano_roll_html(
                 st.session_state["gen_origineel_b64"],
-                hoogte=300, uid="orig",
+                hoogte=260, uid="orig",
                 maat_starts_s=maat_starts,
-                totaal_maten=tm, helft_maten=hm,
-                is_ai=False,
+                totaal_maten=tm, helft_maten=hm, is_ai=False,
             ),
-            height=420, scrolling=False,
+            height=370, scrolling=False,
         )
-
     with col2:
         st.subheader("🤖 AI-aanvulling")
-        st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · door AI gegenereerd")
+        st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · AI (ritme + toonaard behouden)")
         st.components.v1.html(
             _piano_roll_html(
                 st.session_state["gen_ai_b64"],
-                hoogte=300, uid="ai",
+                hoogte=260, uid="ai",
                 maat_starts_s=maat_starts,
-                totaal_maten=tm, helft_maten=hm,
-                is_ai=True,
+                totaal_maten=tm, helft_maten=hm, is_ai=True,
             ),
-            height=420, scrolling=False,
+            height=370, scrolling=False,
         )
+
+    # ── Rij 2: Fine-tuned + Willekeurig ──────────────────────────────────────
+    col3, col4 = st.columns(2)
+    with col3:
+        st.subheader("🧠 Fine-tuned op eerste helft")
+        st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · model bijgetraind op seed")
+        st.components.v1.html(
+            _piano_roll_html(
+                st.session_state["gen_ft_b64"],
+                hoogte=260, uid="ft",
+                maat_starts_s=maat_starts,
+                totaal_maten=tm, helft_maten=hm, is_ai=True,
+            ),
+            height=370, scrolling=False,
+        )
+    with col4:
+        st.subheader("🎲 Volledig willekeurig")
+        st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · willekeurig (geen leren)")
+        st.components.v1.html(
+            _piano_roll_html(
+                st.session_state["gen_rand_b64"],
+                hoogte=260, uid="rand",
+                maat_starts_s=maat_starts,
+                totaal_maten=tm, helft_maten=hm, is_ai=True,
+            ),
+            height=370, scrolling=False,
+        )
+
+    # ── Vergelijking met origineel ────────────────────────────────────────────
+    st.divider()
+    st.subheader("📊 Vergelijking met origineel")
+    st.caption("Scores 0–100: hoe dichter bij het origineel, hoe hoger")
+    vergelijking = st.session_state.get("gen_vergelijking", {})
+    _toon_vergelijking(vergelijking)
 
 
 def _voer_vrije_generatie_uit(
