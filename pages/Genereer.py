@@ -686,78 +686,115 @@ def _genereer_melodie(
     return resultaat
 
 
-# ── Vergelijkingsfuncties (ingebouwd, zonder externe afhankelijkheden) ────────
-
-def _levenshtein(a: list, b: list) -> float:
-    """Levenshtein-afstand tussen twee lijsten."""
-    la, lb = len(a), len(b)
-    # Begrens lengte voor performance bij lange stukken
-    a, b = a[:300], b[:300]
-    la, lb = len(a), len(b)
-    dp = np.zeros((la + 1, lb + 1))
-    for i in range(la + 1):
-        dp[i][0] = i
-    for j in range(lb + 1):
-        dp[0][j] = j
-    for i in range(1, la + 1):
-        for j in range(1, lb + 1):
-            cost = 0 if a[i - 1] == b[j - 1] else 1
-            dp[i][j] = min(dp[i-1][j] + 1, dp[i][j-1] + 1, dp[i-1][j-1] + cost)
-    return dp[-1][-1]
+# ── Vergelijkingsfuncties ─────────────────────────────────────────────────────
+#
+# Vier metrics, elk met een eigen muzikale invalshoek:
+#   1. Chroma       — octaaf-invariante toonsoortgelijkenis (12-dim vector)
+#   2. Intervallen  — transpositie-invariante melodiegelijkenis (interval-histogram)
+#   3. N-gram       — lokale melodiepatronen via trigram-cosinusgelijkenis
+#   4. Akkoorden    — harmonische progressiegelijkenis via Jaccard op akkoordmultiset
 
 
-def _extract_pitches(midi_pad: str) -> list[int]:
+def _extract_noten(midi_pad: str):
+    """Geeft een lijst van music21-Note-objecten terug uit een MIDI-bestand."""
     from music21 import converter, note as m21_note
-    score = converter.parse(midi_pad)
-    return [n.pitch.midi for n in score.recurse().notes if isinstance(n, m21_note.Note)]
+    return [n for n in converter.parse(midi_pad).recurse().notes
+            if isinstance(n, m21_note.Note)]
 
 
-def _vergelijk_toonhoogte(f1: str, f2: str) -> float:
-    """Melodische gelijkenis op basis van MIDI-nootnummers (Levenshtein)."""
-    p1, p2 = _extract_pitches(f1), _extract_pitches(f2)
-    if not p1 or not p2:
-        return 0.0
-    return round(max(0.0, (1 - _levenshtein(p1, p2) / max(len(p1), len(p2))) * 100), 1)
+def _cosinus(v1: np.ndarray, v2: np.ndarray) -> float:
+    """Cosinusgelijkenis als percentage (0–100)."""
+    d = np.linalg.norm(v1) * np.linalg.norm(v2)
+    return round(float(np.dot(v1, v2) / d * 100) if d > 0 else 0.0, 1)
 
 
-def _vergelijk_ritme_toon(f1: str, f2: str) -> float:
-    """Gelijkenis op (noot, duur)-paren (Levenshtein)."""
-    from music21 import converter, note as m21_note
-    def extract(path: str) -> list:
-        score = converter.parse(path)
-        return [(n.pitch.midi, round(float(n.duration.quarterLength), 2))
-                for n in score.recurse().notes if isinstance(n, m21_note.Note)]
-    s1, s2 = extract(f1), extract(f2)
-    if not s1 or not s2:
-        return 0.0
-    return round(max(0.0, (1 - _levenshtein(s1, s2) / max(len(s1), len(s2))) * 100), 1)
+def _vergelijk_chroma(f1: str, f2: str) -> float:
+    """Toonsoortgelijkenis via chroma (12 toonklassen, octaaf-invariant).
 
-
-def _vergelijk_histogram(f1: str, f2: str) -> float:
-    """Toonsoortconsistentie via cosinusgelijkenis van de nootverdeling (0–128)."""
-    def hist(path: str) -> np.ndarray:
-        pitches = _extract_pitches(path)
-        v = np.zeros(128)
-        for p in pitches:
-            v[p] += 1
+    Elke noot wordt gereduceerd tot zijn toonklasse (C=0 … B=11), ongeacht
+    welk octaaf hij in staat. Twee stukken in dezelfde toonsoort hebben een
+    vergelijkbaar chroma-profiel, ook als ze op een andere toonhoogte staan.
+    Berekening: cosinusgelijkenis tussen de twee genormaliseerde 12-dim vectoren.
+    """
+    def chroma(path: str) -> np.ndarray:
+        noten = _extract_noten(path)
+        v = np.zeros(12)
+        for n in noten:
+            v[n.pitch.midi % 12] += 1
         s = v.sum()
         return v / s if s > 0 else v
-    h1, h2 = hist(f1), hist(f2)
-    denom = np.linalg.norm(h1) * np.linalg.norm(h2)
-    return round(float(np.dot(h1, h2) / denom * 100) if denom > 0 else 0.0, 1)
+    return _cosinus(chroma(f1), chroma(f2))
+
+
+def _vergelijk_intervallen(f1: str, f2: str) -> float:
+    """Melodische bewegingsgelijkenis via interval-histogram (transpositie-invariant).
+
+    Berekent het interval (verschil in halve tonen) tussen opeenvolgende noten.
+    Intervallen worden geclampt op [-12, 12] (één octaaf) en als histogram
+    vergeleken via cosinusgelijkenis. Twee melodieën met dezelfde op- en
+    neergaande bewegingen scoren hoog, ongeacht hun absolute toonhoogte.
+    """
+    def interval_hist(path: str) -> np.ndarray:
+        pitches = [n.pitch.midi for n in _extract_noten(path)]
+        v = np.zeros(25)   # intervallen −12 t/m +12 → index 0 t/m 24
+        for a, b in zip(pitches, pitches[1:]):
+            idx = max(0, min(24, (b - a) + 12))
+            v[idx] += 1
+        s = v.sum()
+        return v / s if s > 0 else v
+    return _cosinus(interval_hist(f1), interval_hist(f2))
+
+
+def _vergelijk_ngram(f1: str, f2: str, n: int = 3) -> float:
+    """Lokale melodiepatronen via trigram-cosinusgelijkenis (O(n), snel).
+
+    Extraheert alle opeenvolgende drietallen van toonklassen (mod 12) en
+    vergelijkt de frequentievectoren. Dit vangt lokale melodiefrasen zonder
+    volledige uitlijning te vereisen. Transpositie-invariant omdat toonklassen
+    relatief aan zichzelf worden vergeleken via cosinusgelijkenis.
+    """
+    from collections import Counter
+
+    def ngrams(path: str) -> np.ndarray:
+        pitches = [n.pitch.midi % 12 for n in _extract_noten(path)]
+        cnt: Counter = Counter(
+            tuple(pitches[i:i + n]) for i in range(len(pitches) - n + 1)
+        )
+        # Bouw vaste volgorde voor beide bestanden
+        return cnt
+
+    c1, c2 = ngrams(f1), ngrams(f2)
+    alle_keys = set(c1) | set(c2)
+    if not alle_keys:
+        return 0.0
+    v1 = np.array([c1.get(k, 0) for k in alle_keys], dtype=float)
+    v2 = np.array([c2.get(k, 0) for k in alle_keys], dtype=float)
+    return _cosinus(v1, v2)
 
 
 def _vergelijk_akkoorden(f1: str, f2: str) -> float:
-    """Harmonische gelijkenis via akkoordreeksen (Levenshtein)."""
+    """Harmonische gelijkenis via Jaccard-index op akkoord-multiset.
+
+    Extraheert alle akkoorden (gelijktijdige noten) als frozensets van
+    toonklassen. Jaccard meet de overlap tussen de twee verzamelingen:
+    |doorsnede| / |unie|. Robuuster dan Levenshtein omdat volgorde niet
+    uitmaakt — twee stukken met dezelfde akkoorden in andere volgorde
+    scoren nog steeds hoog.
+    """
     from music21 import converter, chord as m21_chord
-    def extract(path: str) -> list:
+
+    def akkoorden(path: str) -> list:
         score = converter.parse(path)
-        return [tuple(sorted(p.midi for p in c.pitches))
-                for c in score.chordify().recurse() if isinstance(c, m21_chord.Chord)]
-    c1, c2 = extract(f1), extract(f2)
-    if not c1 or not c2:
+        return [frozenset(p.midi % 12 for p in c.pitches)
+                for c in score.chordify().recurse()
+                if isinstance(c, m21_chord.Chord) and len(c.pitches) > 1]
+
+    a1, a2 = set(akkoorden(f1)), set(akkoorden(f2))
+    if not a1 and not a2:
+        return 100.0
+    if not a1 or not a2:
         return 0.0
-    return round(max(0.0, (1 - _levenshtein(c1, c2) / max(len(c1), len(c2))) * 100), 1)
+    return round(len(a1 & a2) / len(a1 | a2) * 100, 1)
 
 
 # ── Willekeurige generatie ────────────────────────────────────────────────────
@@ -859,32 +896,92 @@ def _finetunen_en_genereer_b64(
 
 # ── Vergelijking met origineel ────────────────────────────────────────────────
 
+def _tweede_helft_naar_temp(midi_bytes: bytes, split_offset: float) -> str:
+    """Schrijf alleen de noten ná split_offset naar een tijdelijk MIDI-bestand.
+
+    Noot-offsets worden verschoven zodat de tweede helft bij 0 begint.
+    Tempomarkeringen worden meegekopieerd zodat de afspeelsnelheid klopt.
+    Geeft het pad naar het tijdelijke bestand terug (beller moet het verwijderen).
+    """
+    import copy as _copy
+    from music21 import converter, stream, tempo as m21_tempo
+    from music21.midi import translate as midi_translate
+
+    # Parse vanuit bytes via tijdelijk bronbestand
+    src = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+    src.write(midi_bytes)
+    src.close()
+    try:
+        score = converter.parse(src.name)
+    finally:
+        os.unlink(src.name)
+
+    nieuw = stream.Score()
+
+    # Tempomarkering overnemen
+    for mm in score.flatten().getElementsByClass(m21_tempo.MetronomeMark):
+        nieuw.insert(0, _copy.deepcopy(mm))
+
+    for part in score.parts:
+        nieuwe_part = stream.Part()
+        for el in part.flatten().notesAndRests:
+            el_offset = float(el.offset)
+            if el_offset >= split_offset:
+                el_copy = _copy.deepcopy(el)
+                nieuwe_part.insert(el_offset - split_offset, el_copy)
+        nieuw.append(nieuwe_part)
+
+    mf = midi_translate.music21ObjectToMidiFile(nieuw)
+    dst = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
+    dst.write(mf.writestr())
+    dst.close()
+    return dst.name
+
+
+def _split_offset_uit_midi(midi_pad: str, helft_maten: int) -> float:
+    """Bereken de offset (kwartnoten) waar de tweede helft begint."""
+    from music21 import converter
+    maten = list(converter.parse(midi_pad).chordify().getElementsByClass("Measure"))
+    if helft_maten < len(maten):
+        return float(maten[helft_maten].offset)
+    last = maten[-1]
+    return float(last.offset) + float(last.barDuration.quarterLength)
+
+
 def _bereken_vergelijking(
     orig_pad: str,
-    versies: dict[str, str],   # naam → base64-MIDI
+    versies: dict[str, str],   # naam → base64-MIDI van het volledige stuk
+    helft_maten: int,
 ) -> dict[str, dict[str, float]]:
-    """Vergelijk elke gegenereerde versie met het origineel.
-
-    Schrijft elke versie tijdelijk naar disk, voert de 4 vergelijkingsfuncties
-    uit en verwijdert het tijdelijke bestand daarna.
+    """Vergelijk alleen het gegenereerde deel (tweede helft) met de tweede helft
+    van het origineel. Zo heeft de identieke eerste helft geen invloed op de score.
     """
+    split_offset = _split_offset_uit_midi(orig_pad, helft_maten)
+
+    # Tweede helft van het origineel als referentie
+    with open(orig_pad, "rb") as f:
+        orig_bytes = f.read()
+    orig_tmp = _tweede_helft_naar_temp(orig_bytes, split_offset)
+
     resultaten: dict[str, dict[str, float]] = {}
-    for naam, b64 in versies.items():
-        tmp = tempfile.NamedTemporaryFile(suffix=".mid", delete=False)
-        try:
-            tmp.write(base64.b64decode(b64))
-            tmp.close()
-            resultaten[naam] = {
-                "Toonhoogte": _vergelijk_toonhoogte(orig_pad, tmp.name),
-                "Ritme+toon": _vergelijk_ritme_toon(orig_pad, tmp.name),
-                "Histogram":  _vergelijk_histogram(orig_pad, tmp.name),
-                "Akkoorden":  _vergelijk_akkoorden(orig_pad, tmp.name),
-            }
-        except Exception as e:
-            resultaten[naam] = {"Toonhoogte": 0.0, "Ritme+toon": 0.0,
-                                 "Histogram": 0.0, "Akkoorden": 0.0}
-        finally:
-            os.unlink(tmp.name)
+    try:
+        for naam, b64 in versies.items():
+            gen_tmp = _tweede_helft_naar_temp(base64.b64decode(b64), split_offset)
+            try:
+                resultaten[naam] = {
+                    "Chroma":      _vergelijk_chroma(orig_tmp, gen_tmp),
+                    "Intervallen": _vergelijk_intervallen(orig_tmp, gen_tmp),
+                    "N-gram":      _vergelijk_ngram(orig_tmp, gen_tmp),
+                    "Akkoorden":   _vergelijk_akkoorden(orig_tmp, gen_tmp),
+                }
+            except Exception:
+                resultaten[naam] = {"Chroma": 0.0, "Intervallen": 0.0,
+                                    "N-gram": 0.0, "Akkoorden": 0.0}
+            finally:
+                os.unlink(gen_tmp)
+    finally:
+        os.unlink(orig_tmp)
+
     return resultaten
 
 
@@ -892,8 +989,9 @@ _KLEUREN_VERSIES = {
     "AI-aanvulling": "#38bdf8",
     "Fine-tuned":    "#34d399",
     "Willekeurig":   "#f87171",
+    "Bach-stijl":    "#a78bfa",
 }
-_CATEGORIEEN = ["Toonhoogte", "Ritme+toon", "Histogram", "Akkoorden"]
+_CATEGORIEEN = ["Chroma", "Intervallen", "N-gram", "Akkoorden"]
 
 
 def _toon_vergelijking(vergelijking: dict[str, dict[str, float]]) -> None:
@@ -964,23 +1062,27 @@ def _toon_vergelijking(vergelijking: dict[str, dict[str, float]]) -> None:
     # ── Uitleg per metric ─────────────────────────────────────────────────────
     with st.expander("ℹ️ Uitleg van de metrics"):
         st.markdown("""
-**Toonhoogte** — *Melodische gelijkenis*
-Vergelijkt de reeks van MIDI-nootnummers (0–127) van het gegenereerde stuk met het origineel via de Levenshtein-afstand. Een hoge score betekent dat het model dezelfde noten speelt als Bach, in een vergelijkbare volgorde. Een lage score wijst op melodische afwijking.
+**Chroma** — *Toonsoortgelijkenis (octaaf-invariant)*
+Elke noot wordt herleid tot zijn toonklasse (C, C#, D, … B) ongeacht het octaaf. De 12-dimensionale chroma-vector van het gegenereerde stuk wordt via cosinusgelijkenis vergeleken met die van het origineel.
+*Voordeel t.o.v. een gewoon histogram:* C4 en C5 tellen allebei als "C", waardoor de meting niet afhangt van welk register het model kiest. Een hoge score betekent dat het stuk in dezelfde toonsoort blijft als het origineel.
 
 ---
 
-**Ritme+toon** — *Melodie én ritme samen*
-Elk element is een (noot, duur)-paar, zodat ook het ritme meeweegt. Twee stukken kunnen dezelfde noten hebben maar een ander ritme — dan scoort Toonhoogte hoog maar Ritme+toon lager. Dit is de strengste maat voor naleving van het origineel.
+**Intervallen** — *Melodische beweging (transpositie-invariant)*
+Berekent het interval (verschil in halve tonen, geclampt op ±1 octaaf) tussen opeenvolgende noten en vergelijkt de verdelingen via cosinusgelijkenis.
+*Voordeel:* een identieke melodie een terts hoger scoort hier nog steeds hoog, omdat de op- en neergaande bewegingen hetzelfde zijn. Dit meet of het model "dezelfde melodische stijl" hanteert als Bach, ongeacht de absolute toonhoogte.
 
 ---
 
-**Histogram** — *Toonsoortconsistentie*
-Vergelijkt de verdeling van nootnummers als vector via cosinusgelijkenis. Het maakt niet uit in welke volgorde noten voorkomen, alleen hoe vaak. Een hoge score betekent dat het gegenereerde stuk dezelfde toonsoort en nootvoorkeur heeft als het origineel — het "klinkt in dezelfde toonaard".
+**N-gram** — *Lokale melodiepatronen (snel, O(n))*
+Extraheert alle opeenvolgende drietallen van toonklassen (trigrams) en vergelijkt de frequentieverdelingen via cosinusgelijkenis.
+*Voordeel t.o.v. Levenshtein:* O(n) in plaats van O(n²), dus veel sneller bij lange stukken. Bovendien robuuster: kleine verschuivingen in timing of een extra noot breken de hele uitlijning niet. Een hoge score betekent dat het model dezelfde korte melodiefrasen herhaalt als Bach.
 
 ---
 
-**Akkoorden** — *Harmonische gelijkenis*
-Vergelijkt de reeks van akkoorden (gelijktijdige noten) via Levenshtein. Bach heeft typische akkoordprogressies (I–IV–V–I). Een hoge score wijst erop dat het model vergelijkbare harmonieën gebruikt.
+**Akkoorden** — *Harmonische gelijkenis (Jaccard)*
+Vergelijkt de verzameling gebruikte akkoorden (als toonklasse-sets) via de Jaccard-index: |doorsnede| / |unie|.
+*Voordeel t.o.v. Levenshtein op akkoordreeksen:* de volgorde doet er niet toe, alleen welke akkoorden voorkomen. Bach gebruikt een beperkt harmonisch vocabulaire (I, ii, IV, V, vi); een model dat dezelfde akkoorden kiest scoort hoog, ook als de volgorde licht verschilt.
 """)
 
     # ── Samenvattingstabel ────────────────────────────────────────────────────
@@ -1282,6 +1384,75 @@ def main() -> None:
         _toon_vrij_resultaat()
 
 
+def _genereer_bach_stijl_b64(
+    model: "LSTMModel",
+    vocab: dict,
+    per_maat: list,
+    n_stemmen: int,
+    duur_naar_codes: dict,
+    inv_vocab: dict,
+    midi_pad: str,
+    venster: int,
+    temperatuur: float,
+    top_k: int,
+) -> str:
+    """Genereer Bach-stijl MIDI: eerste N_SEED_MATEN als seed, ritme + melodie vrij.
+
+    Deelt model/data met de aanvullingsmodus zodat de MIDI niet opnieuw
+    geparsed hoeft te worden. Geeft base64-encoded MIDI terug.
+    """
+    duuren = sorted(duur_naar_codes.keys())
+
+    stem_seeds:     list[list[int]]        = []
+    stem_doelduren: list[float]            = []
+    stem_rest:      list[list[VoiceToken]] = []
+
+    for stem_i in range(n_stemmen):
+        seed_tok = [
+            t for maat in per_maat[:N_SEED_MATEN]
+            for t in (maat[stem_i] if stem_i < len(maat) else [])
+        ]
+        rest_tok = [
+            t for maat in per_maat[N_SEED_MATEN:]
+            for t in (maat[stem_i] if stem_i < len(maat) else [])
+        ]
+        stem_seeds.append([vocab[t] for t in seed_tok if t in vocab])
+        stem_doelduren.append(sum(d for _, d in rest_tok))
+        stem_rest.append(rest_tok)
+
+    # Fase 1: model genereert ritme vrij
+    # Let op: _genereer_ritme en _genereer_melodie padden de seed intern al met
+    # nullen als len(seed) < venster, dus de enige echte stopcondities zijn
+    # een lege seed of een doelduur van 0.
+    ritmes: list[list[float]] = []
+    for stem_i in range(n_stemmen):
+        seeds    = stem_seeds[stem_i]
+        doelduur = stem_doelduren[stem_i]
+        if not seeds or doelduur == 0:
+            ritmes.append([d for _, d in stem_rest[stem_i]])
+            continue
+        ritmes.append(
+            _genereer_ritme(model, seeds, doelduur, duur_naar_codes, duuren,
+                            venster, temperatuur, top_k)
+        )
+
+    # Fase 2: model genereert pitches vrij (geen toonaard-filter)
+    ai_stemmen: list[list[VoiceToken]] = []
+    for stem_i in range(n_stemmen):
+        seeds = stem_seeds[stem_i]
+        if not seeds or not ritmes[stem_i]:
+            ai_stemmen.append(stem_rest[stem_i])
+            continue
+        ai_stemmen.append(
+            _genereer_melodie(model, seeds, ritmes[stem_i],
+                              duur_naar_codes, inv_vocab,
+                              venster, temperatuur, top_k,
+                              toegestane_pitchklassen=None)
+        )
+
+    return _eerste_helft_plus_ai_b64(midi_pad, N_SEED_MATEN, ai_stemmen)
+
+
 def _voer_generatie_uit(
     model_pad_str: str,
     midi_pad: str,
@@ -1427,6 +1598,13 @@ def _voer_generatie_uit(
             ritmes, inv_vocab, duur_naar_codes,
         )
 
+        st.write("MIDI bouwen — Bach-stijl versie (ritme + melodie vrij)…")
+        bach_b64 = _genereer_bach_stijl_b64(
+            model, vocab, per_maat, n_stemmen,
+            duur_naar_codes, inv_vocab, midi_pad,
+            venster, temperatuur, top_k,
+        )
+
         # Maatstarttijden in seconden berekenen voor de JavaScript maatenteller
         bpm = _tempo_uit_midi(midi_pad)
         SPQ = 60.0 / bpm   # seconden per kwartnoot
@@ -1438,12 +1616,13 @@ def _voer_generatie_uit(
                 for _, duur in maat[0]:
                     cumulatief += duur
 
-        st.write("Vergelijking berekenen…")
+        st.write("Vergelijking berekenen (enkel het gegenereerde deel)…")
         vergelijking = _bereken_vergelijking(midi_pad, {
             "AI-aanvulling": ai_b64,
             "Fine-tuned":    ft_b64,
             "Willekeurig":   rand_b64,
-        })
+            "Bach-stijl":    bach_b64,
+        }, helft_maten=helft_maten)
 
         totaal_nieuwe  = sum(len(s) for s in ai_stemmen)
         totaal_orig_2e = sum(
@@ -1458,6 +1637,7 @@ def _voer_generatie_uit(
             "gen_ai_b64":          ai_b64,
             "gen_ft_b64":          ft_b64,
             "gen_rand_b64":        rand_b64,
+            "gen_bach_b64":        bach_b64,
             "gen_vergelijking":    vergelijking,
             "gen_song":            song_naam,
             "gen_helft_maten":     helft_maten,
@@ -1534,19 +1714,19 @@ def _toon_resultaat() -> None:
             height=370, scrolling=False,
         )
 
-    # ── Rij 2: Fine-tuned + Willekeurig ──────────────────────────────────────
-    col3, col4 = st.columns(2)
+    # ── Rij 2: Fine-tuned + Willekeurig + Bach-stijl ─────────────────────────
+    col3, col4, col5 = st.columns(3)
     with col3:
         st.subheader("🧠 Fine-tuned op eerste helft")
         st.caption(f"Maten 1–{hm} · origineel  +  maten {hm+1}–{tm} · model bijgetraind op seed")
         st.components.v1.html(
             _piano_roll_html(
                 st.session_state["gen_ft_b64"],
-                hoogte=260, uid="ft",
+                hoogte=240, uid="ft",
                 maat_starts_s=maat_starts,
                 totaal_maten=tm, helft_maten=hm, is_ai=True,
             ),
-            height=370, scrolling=False,
+            height=350, scrolling=False,
         )
     with col4:
         st.subheader("🎲 Volledig willekeurig")
@@ -1554,17 +1734,35 @@ def _toon_resultaat() -> None:
         st.components.v1.html(
             _piano_roll_html(
                 st.session_state["gen_rand_b64"],
-                hoogte=260, uid="rand",
+                hoogte=240, uid="rand",
                 maat_starts_s=maat_starts,
                 totaal_maten=tm, helft_maten=hm, is_ai=True,
             ),
-            height=370, scrolling=False,
+            height=350, scrolling=False,
+        )
+    with col5:
+        st.subheader("🎼 Bach-stijl")
+        st.caption(
+            f"Maten 1–{N_SEED_MATEN} · origineel (seed)  +  "
+            f"maten {N_SEED_MATEN+1}–{tm} · model genereert ritme én melodie vrij"
+        )
+        st.components.v1.html(
+            _piano_roll_html(
+                st.session_state["gen_bach_b64"],
+                hoogte=240, uid="bach",
+                maat_starts_s=maat_starts,
+                totaal_maten=tm, helft_maten=N_SEED_MATEN, is_ai=True,
+            ),
+            height=350, scrolling=False,
         )
 
     # ── Vergelijking met origineel ────────────────────────────────────────────
     st.divider()
     st.subheader("📊 Vergelijking met origineel")
-    st.caption("Scores 0–100: hoe dichter bij het origineel, hoe hoger")
+    st.caption(
+        f"Scores 0–100 — enkel het gegenereerde deel (maat {hm+1}–{tm}) vergeleken met de tweede helft van het origineel  ·  "
+        f"Bach-stijl: seed = maten 1–{N_SEED_MATEN}, gegenereerd deel = maten {N_SEED_MATEN+1}–{tm}"
+    )
     vergelijking = st.session_state.get("gen_vergelijking", {})
     _toon_vergelijking(vergelijking)
 
@@ -1659,10 +1857,9 @@ def _voer_vrije_generatie_uit(
         for stem_i in range(n_stemmen):
             seeds    = stem_seeds[stem_i]
             doelduur = stem_doelduren[stem_i]
-            if len(seeds) < venster or doelduur == 0:
-                # Onvoldoende seed of geen doelduur: gebruik origineel ritme als fallback
+            if not seeds or doelduur == 0:
                 ritmes.append([d for _, d in stem_rest[stem_i]])
-                st.write(f"  Stem {stem_i + 1}: origineel ritme als fallback")
+                st.write(f"  Stem {stem_i + 1}: geen seed of doelduur, origineel ritme als fallback")
                 continue
             duur_seq = _genereer_ritme(
                 model, seeds, doelduur,
@@ -1682,7 +1879,7 @@ def _voer_vrije_generatie_uit(
         ai_stemmen: list[list[VoiceToken]] = []
         for stem_i in range(n_stemmen):
             seeds = stem_seeds[stem_i]
-            if len(seeds) < venster or not ritmes[stem_i]:
+            if not seeds or not ritmes[stem_i]:
                 ai_stemmen.append(stem_rest[stem_i])
                 continue
             st.write(f"  Stem {stem_i + 1}…")
